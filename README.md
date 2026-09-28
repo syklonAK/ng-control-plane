@@ -54,6 +54,19 @@ existing configuration against the new version. It never touches generated
 nginx fragments, snapshots, or the live config — re-deploy explicitly with
 `pg-router apply`.
 
+## Uninstall
+
+```bash
+sudo pg-router uninstall                 # removes CLI + virtualenv, keeps config
+sudo pg-router uninstall --yes --purge   # unattended, also removes config + fragments
+```
+
+The uninstaller deletes the CLI symlink and the installation directory. It asks
+for confirmation on every step (or never, with `--yes`) and never removes nginx
+itself, the configuration file, or generated fragments unless `--purge` is
+given. The include lines in `/etc/nginx/nginx.conf` are left in place so a live
+server keeps serving while you decide.
+
 ## Interactive menu
 
 Running `pg-router` with no subcommand on a real terminal opens a menu:
@@ -173,10 +186,10 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Tests
 
 ```bash
-python -m pytest            # 153 tests: schema, matchers, validators, loops,
+python -m pytest            # 164 tests: schema, matchers, validators, loops,
                             # http/stream generation, tunnels, deploy/rollback,
                             # health/failover, installer, CLI, interactive menu,
-                            # end-to-end
+                            # update/uninstall script discovery, end-to-end
 ```
 
 ## Environment variables

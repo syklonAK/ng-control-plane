@@ -112,3 +112,6 @@ echo "Or simply run 'pg-router' with no arguments on a terminal for the menu."
 echo
 echo "Update later with:"
 echo "  pg-router update"
+echo
+echo "Remove with:"
+echo "  pg-router uninstall [--yes] [--purge]"

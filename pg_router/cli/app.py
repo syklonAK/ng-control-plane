@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 from typing import Optional
 
 from .. import __version__
@@ -102,6 +104,9 @@ def _build_parser() -> argparse.ArgumentParser:
     health_sub.add_parser("failover", help="Apply health state to failover groups")
 
     sub.add_parser("update", help="Update pg-router from git and reinstall")
+    sub.add_parser("uninstall", help="Remove the CLI, virtualenv and (with --purge) fragments").add_argument(
+        "--purge", action="store_true", help="Also delete the configuration and nginx fragments"
+    )
     sub.add_parser("menu", help="Interactive terminal menu")
 
     return parser
@@ -131,6 +136,7 @@ class CLI:
             "nginx": self._nginx,
             "health": self._health,
             "update": self._update,
+            "uninstall": self._uninstall,
             "menu": self._menu,
         }
         handler = handlers.get(self.args.command)
@@ -275,20 +281,66 @@ class CLI:
         # reinstall. Invoked as an argv list so no shell interpolation of
         # configuration values can occur. Output is streamed because the
         # updater is interactive and prints its own [INFO] progress lines.
-        from pathlib import Path
-
-        script = Path(__file__).resolve().parent.parent.parent / "update.sh"
-        if not script.exists():
-            raise CommandError(f"update.sh not found next to installation: {script}")
+        script = _find_shipped_script("update.sh")
         _log.info("running updater: %s", script)
         subprocess.run([str(script)], check=False, shell=False)
         return {"updated": True, "script": str(script)}
+
+    def _uninstall(self):
+        # Same pattern as _update: run the shipped uninstaller as an argv
+        # list. The confirmation prompts live in the script so the logic is
+        # not duplicated between shell and Python entry points.
+        script = _find_shipped_script("uninstall.sh")
+        argv = [str(script)]
+        if self.args.yes:
+            argv.append("--yes")
+        if self.args.purge:
+            argv.append("--purge")
+        _log.info("running uninstaller: %s", " ".join(argv))
+        subprocess.run(argv, check=False, shell=False)
+        return {"uninstalled": True, "script": str(script)}
 
     def _menu(self):
         from .menu import run_menu
 
         run_menu(_global_argv(self.args))
         return None
+
+
+def _find_shipped_script(name: str) -> Path:
+    """Locate a script shipped at the project root.
+
+    ``pip install`` of a git clone nests the package deep inside the venv
+    (``<root>/venv/lib/python3.x/site-packages/pg_router/cli/``), so walking a
+    fixed number of parents up from ``__file__`` is not enough. Instead the
+    tree is searched upward for the directory that *owns* the project — the one
+    containing ``pyproject.toml`` next to a ``pg_router`` package — and the
+    script is read from there. ``PG_ROUTER_HOME`` overrides everything.
+    """
+    override = os.environ.get("PG_ROUTER_HOME")
+    if override:
+        candidate = Path(override) / name
+        if candidate.is_file():
+            return candidate
+        raise CommandError(f"{name} not found in PG_ROUTER_HOME ({override})")
+
+    here = Path(__file__).resolve()
+    directory = here.parent
+    for _ in range(12):  # bounded: never escapes past the filesystem root
+        if (directory / "pyproject.toml").is_file() and (directory / "pg_router").is_dir():
+            candidate = directory / name
+            if not candidate.is_file():
+                raise CommandError(f"{name} missing at project root ({directory})")
+            return candidate
+        parent = directory.parent
+        if parent == directory:
+            break
+        directory = parent
+
+    raise CommandError(
+        f"{name} not found: could not locate the project root from {here} "
+        "(set PG_ROUTER_HOME to the installation directory)"
+    )
 
 
 def _global_argv(args: argparse.Namespace) -> list[str]:
