@@ -1,0 +1,45 @@
+# =============================================================================
+# Example 4: Minimal single-node direct deployment (panel + node on one host).
+#
+# Demonstrates that the simplest possible topology needs no tunnels, no
+# chains and no PasarGuard-specific assumptions: one listener, one route,
+# one local backend.
+# =============================================================================
+version: 1
+
+node:
+  id: single-01
+  roles:
+    - edge
+    - backend
+
+certificates:
+  - id: self
+    provider: existing
+    chain: /etc/pg-router/certs/fullchain.pem
+    key: /etc/pg-router/certs/privkey.pem
+
+listeners:
+  - id: public-https
+    address: 0.0.0.0
+    port: 443
+    mode: http
+    tls:
+      mode: terminate
+      certificate: self
+
+backends:
+  - id: pg-local
+    type: local
+    host: 127.0.0.1
+    port: 62050
+
+routes:
+  - id: ws-route
+    listener: public-https
+    transport:
+      type: ws
+    match:
+      type: path_prefix
+      value: /
+    backend: pg-local

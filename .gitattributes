@@ -1,0 +1,10 @@
+# Shell scripts must keep LF endings; CRLF breaks the shebang on Linux.
+*.sh         text eol=lf
+*.py         text eol=lf
+*.yaml       text eol=lf
+*.yml        text eol=lf
+*.md         text eol=lf
+*.toml       text eol=lf
+
+# Treat everything else as text with automatic normalization.
+*            text=auto

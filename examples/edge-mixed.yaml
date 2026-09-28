@@ -1,0 +1,149 @@
+# =============================================================================
+# Example 1: Edge server with mixed HTTP (WS) and stream (SNI) routing.
+#
+# Topology:
+#
+#                    INTERNET
+#                       |
+#                   :443 (http)          :8443 (stream)
+#                       |                    |
+#                  Nginx Router        Nginx Router
+#                       |                    |
+#   +-------------------+----------------+   +-------------------+
+#   |                                      |                     |
+# WS /nl route                      TCP SNI route        default route
+#   |                                      |                     |
+# Reverse tunnel                   Direct tunnel          Local backend
+#   |                                      |                     |
+# SERVER NL                          SERVER FR            PG :62052
+#   |                                      |
+# Nginx -> PG :62050               Nginx -> PG :62051
+# =============================================================================
+version: 1
+
+node:
+  id: edge-01
+  roles:
+    - edge
+    - relay
+
+defaults:
+  connect_timeout: 10s
+  read_timeout: 1w
+  send_timeout: 1w
+  client_max_body_size: 0
+  health_check:
+    enabled: true
+    interval: 10s
+    timeout: 3s
+    retries: 3
+
+certificates:
+  - id: wildcard
+    provider: existing
+    chain: /etc/letsencrypt/live/example.com/fullchain.pem
+    key: /etc/letsencrypt/live/example.com/privkey.pem
+
+listeners:
+  - id: public-https
+    address: 0.0.0.0
+    port: 443
+    mode: http
+    tls:
+      mode: terminate
+      certificate: wildcard
+
+  - id: public-stream
+    address: 0.0.0.0
+    port: 8443
+    mode: stream
+    unknown_policy: reject
+    tls:
+      mode: passthrough
+
+backends:
+  - id: pg-nl
+    type: tunnel
+    tunnel: nl-reverse
+    health_check:
+      enabled: true
+      type: tcp
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  - id: pg-fr
+    type: tunnel
+    tunnel: fr-direct
+
+  - id: pg-local
+    type: local
+    host: 127.0.0.1
+    port: 62052
+
+tunnels:
+  # The NL node dials IN to this edge; nginx reaches it on 127.0.0.1:41001.
+  - id: nl-reverse
+    mode: reverse
+    provider: custom
+    listener:
+      address: 127.0.0.1
+      port: 41001
+    remote:
+      node: nl-node
+    target:
+      host: 127.0.0.1
+      port: 62050
+
+  # This edge reaches the FR node directly at 10.0.0.20:40001.
+  - id: fr-direct
+    mode: direct
+    provider: custom
+    remote:
+      node: fr-node
+      host: 10.0.0.20
+      port: 40001
+    target:
+      host: 127.0.0.1
+      port: 62051
+
+pasarguard:
+  inbounds:
+    - id: nl-vless
+      host: 127.0.0.1
+      port: 62050
+    - id: fr-vless
+      host: 127.0.0.1
+      port: 62051
+
+routes:
+  - id: nl-ws
+    listener: public-https
+    transport:
+      type: ws
+      read_timeout: 1w
+    match:
+      all:
+        - type: host
+          value: example.com
+        - type: path_prefix
+          value: /nl
+    backend: pg-nl
+
+  - id: fr-tcp
+    listener: public-stream
+    transport:
+      type: tcp
+    match:
+      any:
+        - type: sni
+          value: fr.example.com
+        - type: sni
+          value: fr2.example.com
+    backend: pg-fr
+
+  - id: local-default
+    listener: public-stream
+    transport:
+      type: tcp
+    backend: pg-local

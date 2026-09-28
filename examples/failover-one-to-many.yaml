@@ -1,0 +1,155 @@
+# =============================================================================
+# Example 3: One-to-many + many-to-one + failover.
+#
+# One edge, three regional tunnels (one-to-many); a failover backend group
+# provides backup paths (many-to-one into the same PasarGuard inbound).
+# =============================================================================
+version: 1
+
+node:
+  id: edge-eu
+  roles:
+    - edge
+    - gateway
+
+certificates:
+  - id: eu-cert
+    provider: existing
+    chain: /etc/letsencrypt/live/eu.example.com/fullchain.pem
+    key: /etc/letsencrypt/live/eu.example.com/privkey.pem
+
+listeners:
+  - id: public-https
+    address: 0.0.0.0
+    port: 443
+    mode: http
+    tls:
+      mode: terminate
+      certificate: eu-cert
+
+  - id: public-alt
+    address: 0.0.0.0
+    port: 8443
+    mode: http
+    tls:
+      mode: terminate
+      certificate: eu-cert
+
+backends:
+  - id: pg-nl
+    type: tunnel
+    tunnel: tunnel-nl
+
+  - id: pg-fr
+    type: tunnel
+    tunnel: tunnel-fr
+
+  - id: pg-de-local
+    type: local
+    host: 127.0.0.1
+    port: 62052
+
+  # Failover group: prefer the direct tunnel, fall back to the mesh tunnel,
+  # then to the local PasarGuard inbound (many paths, one destination).
+  - id: pg-de-resilient
+    type: failover
+    primary: pg-de-direct
+    backups:
+      - pg-de-mesh
+      - pg-de-local
+
+  - id: pg-de-direct
+    type: tunnel
+    tunnel: tunnel-de
+
+  - id: pg-de-mesh
+    type: remote
+    host: 10.144.144.10
+    port: 62052
+
+tunnels:
+  - id: tunnel-nl
+    mode: reverse
+    provider: custom
+    listener:
+      address: 127.0.0.1
+      port: 41001
+    target:
+      host: 127.0.0.1
+      port: 62050
+
+  - id: tunnel-fr
+    mode: reverse
+    provider: custom
+    listener:
+      address: 127.0.0.1
+      port: 41002
+    target:
+      host: 127.0.0.1
+      port: 62051
+
+  - id: tunnel-de
+    mode: direct
+    provider: custom
+    remote:
+      host: 10.0.0.30
+      port: 40001
+    target:
+      host: 127.0.0.1
+      port: 62052
+
+pasarguard:
+  inbounds:
+    - id: de-vless
+      host: 127.0.0.1
+      port: 62052
+
+routes:
+  - id: nl
+    listener: public-https
+    transport: {type: ws}
+    match:
+      all:
+        - type: host
+          value: eu.example.com
+        - type: path_prefix
+          value: /nl
+    backend: pg-nl
+
+  - id: fr
+    listener: public-https
+    transport: {type: httpupgrade}
+    match:
+      all:
+        - type: host
+          value: eu.example.com
+        - type: path_prefix
+          value: /fr
+    backend: pg-fr
+
+  - id: de
+    listener: public-https
+    transport: {type: xhttp}
+    match:
+      all:
+        - type: host
+          value: eu.example.com
+        - type: path_prefix
+          value: /de
+    backend: pg-de-resilient
+    health_check:
+      enabled: true
+      failover: true
+      interval: 10s
+      timeout: 3s
+      fall: 3
+      rise: 2
+
+  # Same domain on a different public port: multi-listener deployment.
+  - id: de-alt
+    listener: public-alt
+    transport: {type: ws}
+    match:
+      type: path_prefix
+      value: /de
+    backend: pg-de-resilient
