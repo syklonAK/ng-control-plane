@@ -54,6 +54,38 @@ existing configuration against the new version. It never touches generated
 nginx fragments, snapshots, or the live config — re-deploy explicitly with
 `pg-router apply`.
 
+## Interactive menu
+
+Running `pg-router` with no subcommand on a real terminal opens a menu:
+
+```text
+$ pg-router -c /etc/pg-router/config.yaml
+
+pg-router 1.0.0 — interactive menu
+config: /etc/pg-router/config.yaml
+
+  1) Status — nginx, objects, snapshots
+  2) Validate configuration
+  3) Generate fragments (dry run)
+  4) Generate fragments to a directory
+ *5) Apply — validate, generate, test, deploy
+ *6) Rollback to a previous snapshot
+  7) Routes — list
+  8) Routes — simulate a request
+  9) Backends — list
+  t) Tunnels
+  n) Nginx
+  h) Health checks and failover
+  i) Initialise a starter configuration
+ *u) Update pg-router from git
+  0) Quit
+```
+
+Entries marked `*` ask for confirmation. The menu only builds an argument list
+and hands it to the same code path the scripted commands use, so nothing the
+menu can do is impossible from a shell — and scripted use is unaffected (no
+terminal ⇒ usage is printed and the exit code is `2`).
+
 ## Quick start
 
 ```bash
@@ -65,6 +97,8 @@ pg-router apply                      # atomic deploy: backup → test → swap �
 pg-router status                     # nginx, objects, snapshots
 pg-router rollback                   # restore previous known-good configuration
 ```
+
+Or step through the same workflow from the interactive menu (see below).
 
 ## Object model
 
@@ -139,9 +173,10 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Tests
 
 ```bash
-python -m pytest            # 137 tests: schema, matchers, validators, loops,
+python -m pytest            # 153 tests: schema, matchers, validators, loops,
                             # http/stream generation, tunnels, deploy/rollback,
-                            # health/failover, installer, CLI, end-to-end
+                            # health/failover, installer, CLI, interactive menu,
+                            # end-to-end
 ```
 
 ## Environment variables
@@ -151,6 +186,7 @@ python -m pytest            # 137 tests: schema, matchers, validators, loops,
 | `PG_ROUTER_CONFIG` | Configuration file path |
 | `PG_ROUTER_DATA_DIR` | Managed fragment directory (default `/etc/nginx/pg-router`) |
 | `PG_ROUTER_LOG_LEVEL` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
+| `PG_ROUTER_MENU` | Force the interactive menu on even when stdin is not a terminal |
 | `PG_ROUTER_API_BIND` | Reserved for the future API server |
 
 Secrets never need to live in YAML: `${VAR}` and `${VAR:-default}` placeholders

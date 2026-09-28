@@ -102,10 +102,13 @@ fi
 echo "[INFO] $( "${BIN_LINK}" --version 2>&1 ) installed successfully"
 echo
 echo "Next steps:"
-echo "  pg-router init                        # create starter config"
+echo "  pg-router menu                       # interactive terminal menu"
+echo "  pg-router init                       # create starter config"
 echo "  pg-router -c /etc/pg-router/config.yaml validate"
 echo "  pg-router -c /etc/pg-router/config.yaml generate --dry-run"
 echo "  pg-router -c /etc/pg-router/config.yaml apply"
+echo
+echo "Or simply run 'pg-router' with no arguments on a terminal for the menu."
 echo
 echo "Update later with:"
 echo "  pg-router update"

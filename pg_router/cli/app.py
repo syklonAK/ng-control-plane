@@ -102,6 +102,7 @@ def _build_parser() -> argparse.ArgumentParser:
     health_sub.add_parser("failover", help="Apply health state to failover groups")
 
     sub.add_parser("update", help="Update pg-router from git and reinstall")
+    sub.add_parser("menu", help="Interactive terminal menu")
 
     return parser
 
@@ -130,6 +131,7 @@ class CLI:
             "nginx": self._nginx,
             "health": self._health,
             "update": self._update,
+            "menu": self._menu,
         }
         handler = handlers.get(self.args.command)
         if handler is None:
@@ -282,6 +284,28 @@ class CLI:
         subprocess.run([str(script)], check=False, shell=False)
         return {"updated": True, "script": str(script)}
 
+    def _menu(self):
+        from .menu import run_menu
+
+        run_menu(_global_argv(self.args))
+        return None
+
+
+def _global_argv(args: argparse.Namespace) -> list[str]:
+    """Rebuild the global flag list so the menu re-enters the CLI identically."""
+    out: list[str] = []
+    if args.config:
+        out += ["--config", args.config]
+    if args.managed_dir:
+        out += ["--managed-dir", args.managed_dir]
+    if args.log_level:
+        out += ["--log-level", args.log_level]
+    if args.json:
+        out += ["--json"]
+    if args.yes:
+        out += ["--yes"]
+    return out
+
 
 # ---------------------------------------------------------------------------
 # output formatting
@@ -322,11 +346,74 @@ def _human(value, indent: int = 0) -> str:
     return "" if value is None else str(value)
 
 
+def _enter_menu(argv: Optional[list[str]] = None) -> int:
+    """Run the interactive menu (used when no subcommand is given).
+
+    The subparser is marked optional on a throwaway parser, because a missing
+    subcommand is the *expected* input here — it is supplied interactively.
+    """
+    register_defaults()
+    parser = _build_parser()
+    parser._subparsers._group_actions[0].required = False
+    args, _ = parser.parse_known_args(argv)
+    configure(args.log_level)
+    from .menu import run_menu
+
+    return run_menu(_global_argv(args))
+
+
+def _is_interactive() -> bool:
+    import os
+    import sys
+
+    if os.environ.get("PG_ROUTER_MENU"):
+        return True
+    return bool(getattr(sys.stdin, "isatty", lambda: False)())
+
+
+_VALUE_FLAGS = ("--config", "-c", "--managed-dir", "--log-level")
+
+
+def _has_command(argv: Optional[list[str]]) -> bool:
+    """True when argv names a subcommand (or asks for help/version).
+
+    ``None`` means argparse will read ``sys.argv`` itself, so that is what we
+    inspect here.
+    """
+    import sys
+
+    tokens = list(sys.argv[1:]) if argv is None else [str(token) for token in argv]
+    if not tokens:
+        return False
+    if any(token in ("-h", "--help", "--version") for token in tokens):
+        return True
+    parser = _build_parser()
+    known = set(parser._subparsers._group_actions[0].choices.keys())
+    expect_value = False
+    for token in tokens:
+        if expect_value:
+            expect_value = False
+            continue
+        if token in _VALUE_FLAGS:
+            expect_value = True
+            continue
+        if token in known:
+            return True
+    return False
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     register_defaults()
+    if not _has_command(argv):
+        # Without a subcommand there is nothing to run non-interactively, so
+        # drop into the menu on a real terminal, or usage on a pipe/cron.
+        if _is_interactive():
+            return _enter_menu(argv)
+        _build_parser().print_help()
+        return 2
     args = _build_parser().parse_args(argv)
     configure(args.log_level)
-    if not args.json:
+    if not args.json and args.command != "menu":
         _log.info("pg-router %s — command: %s", __version__, args.command)
     return CLI(args).run()
 
