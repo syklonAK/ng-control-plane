@@ -55,6 +55,20 @@ def _build_parser() -> argparse.ArgumentParser:
     init.add_argument("--path", help="Where to write the configuration")
     init.add_argument("--interactive", "-i", action="store_true", help="Prompt for values")
 
+    wiz = sub.add_parser("wizard", help="Guided configuration builder")
+    wiz.add_argument("--path", help="Configuration file to build (default: ./pg-router.yaml)")
+    wiz.add_argument(
+        "--sections",
+        nargs="*",
+        help="Sections to build, in order: node certificate listener tunnel backend route",
+    )
+    wiz.add_argument(
+        "--preset",
+        choices=["entry", "exit", "custom"],
+        default="entry",
+        help="Which sections to walk through (custom takes --sections)",
+    )
+
     sub.add_parser("validate", help="Validate the configuration")
     gen = sub.add_parser("generate", help="Generate nginx fragments")
     gen.add_argument("--dry-run", action="store_true", help="Validate without touching nginx")
@@ -138,6 +152,7 @@ class CLI:
             "update": self._update,
             "uninstall": self._uninstall,
             "menu": self._menu,
+            "wizard": self._wizard,
         }
         handler = handlers.get(self.args.command)
         if handler is None:
@@ -278,26 +293,22 @@ class CLI:
 
     def _update(self):
         # Delegate to the shipped update.sh; it performs the git pull and
-        # reinstall. Invoked as an argv list so no shell interpolation of
-        # configuration values can occur. Output is streamed because the
-        # updater is interactive and prints its own [INFO] progress lines.
+        # reinstall. Output is streamed because the updater is interactive and
+        # prints its own [INFO] progress lines.
         script = _find_shipped_script("update.sh")
-        _log.info("running updater: %s", script)
-        subprocess.run([str(script)], check=False, shell=False)
+        _run_script(script, [])
         return {"updated": True, "script": str(script)}
 
     def _uninstall(self):
-        # Same pattern as _update: run the shipped uninstaller as an argv
-        # list. The confirmation prompts live in the script so the logic is
-        # not duplicated between shell and Python entry points.
+        # Same pattern as _update. The confirmation prompts live in the script
+        # so the logic is not duplicated between shell and Python entry points.
         script = _find_shipped_script("uninstall.sh")
-        argv = [str(script)]
+        extra: list[str] = []
         if self.args.yes:
-            argv.append("--yes")
+            extra.append("--yes")
         if self.args.purge:
-            argv.append("--purge")
-        _log.info("running uninstaller: %s", " ".join(argv))
-        subprocess.run(argv, check=False, shell=False)
+            extra.append("--purge")
+        _run_script(script, extra)
         return {"uninstalled": True, "script": str(script)}
 
     def _menu(self):
@@ -305,6 +316,16 @@ class CLI:
 
         run_menu(_global_argv(self.args))
         return None
+
+    def _wizard(self):
+        from .wizard import EXIT_FLOW, run_wizard
+
+        target = self.args.path or self.config_service.config_path or "pg-router.yaml"
+        sections = self.args.sections if self.args.preset == "custom" else None
+        if sections is None:
+            sections = EXIT_FLOW if self.args.preset == "exit" else None
+        run_wizard(target, sections, prompt=input)
+        return {"path": str(target)}
 
 
 def _find_shipped_script(name: str) -> Path:
@@ -341,6 +362,28 @@ def _find_shipped_script(name: str) -> Path:
         f"{name} not found: could not locate the project root from {here} "
         "(set PG_ROUTER_HOME to the installation directory)"
     )
+
+
+def _run_script(script: Path, extra: list[str]) -> None:
+    """Execute a shipped shell script.
+
+    Always via ``bash <script>``, never the path directly: git clones may hold
+    the script without the executable bit (or on a filesystem that ignores
+    it), and this is the failure that produced PermissionError on the server.
+    ``shell=False`` still holds — the script path is an argv element, not a
+    string evaluated by a shell.
+    """
+    argv = [_shell(), str(script)] + [str(item) for item in extra]
+    _log.info("running %s", " ".join(argv))
+    subprocess.run(argv, check=False, shell=False)
+
+
+def _shell() -> str:
+    """A bash capable of running the shipped scripts."""
+    for candidate in ("/usr/bin/env bash", "/bin/bash", "/usr/bin/bash"):
+        if Path(candidate.split()[0]).exists():
+            return candidate
+    return "bash"
 
 
 def _global_argv(args: argparse.Namespace) -> list[str]:

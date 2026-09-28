@@ -71,55 +71,71 @@ def _prompt_snapshot(menu: "Menu") -> list[str]:
     return ["rollback", snapshot] if snapshot else ["rollback"]
 
 
-def _prompt_output_dir(menu: "Menu") -> list[str]:
-    directory = menu.ask("Output directory", "generated")
-    return ["--output-dir", directory]
+def _prompt_wizard_entry(menu: "Menu") -> list[str]:
+    return _wizard_argv(menu, ["--preset", "entry"])
 
 
-def _prompt_init(menu: "Menu") -> list[str]:
-    path = menu.ask("Configuration path", "pg-router.yaml")
-    return ["init", "--path", path]
+def _prompt_wizard_exit(menu: "Menu") -> list[str]:
+    return _wizard_argv(menu, ["--preset", "exit"])
 
 
-# ---------------------------------------------------------------------------
-# menus
-# ---------------------------------------------------------------------------
+def _prompt_wizard_custom(menu: "Menu") -> list[str]:
+    sections = menu.ask("Sections, comma separated (node certificate listener tunnel backend route)",
+                        "listener,backend,route")
+    picked = [s.strip() for s in sections.split(",") if s.strip()]
+    return _wizard_argv(menu, ["--preset", "custom", "--sections", *picked])
 
-TUNNEL_MENU = [
-    Item("1", "List configured tunnels", ["tunnels", "list"]),
-    Item("2", "Probe tunnels", ["tunnels", "status"]),
+
+def _wizard_argv(menu: "Menu", extra: list[str]) -> list[str]:
+    """Point the wizard at the same config file the menu was opened with."""
+    config = _flag_value(menu.base_argv, "--config", "-c")
+    argv = ["wizard"]
+    if config:
+        argv += ["--path", config]
+    return argv + extra
+
+
+ROUTES_MENU = [
+    Item("1", "List routes", ["routes", "list"]),
+    Item("2", "Simulate a request", ["routes", "test"], prompt=_prompt_request),
+    Item("0", "Back to main menu", back=True),
+]
+
+OBJECTS_MENU = [
+    Item("1", "List backends", ["backends", "list"]),
+    Item("2", "List configured tunnels", ["tunnels", "list"]),
+    Item("3", "Probe tunnels", ["tunnels", "status"]),
+    Item("4", "Probe all targets", ["health", "check"]),
+    Item("5", "Apply failover state", ["health", "failover"], confirm=True),
+    Item("0", "Back to main menu", back=True),
+]
+
+WIZARD_MENU = [
+    Item("1", "Entry server (edge: listens, routes, tunnels to backends)", [], prompt=_prompt_wizard_entry),
+    Item("2", "Exit server (backend: tunnels out, serves a backend)", [], prompt=_prompt_wizard_exit),
+    Item("3", "Custom — pick the sections yourself", [], prompt=_prompt_wizard_custom),
     Item("0", "Back to main menu", back=True),
 ]
 
 NGINX_MENU = [
     Item("1", "Test configuration (nginx -t)", ["nginx", "test"]),
-    Item("2", "Reload nginx", ["nginx", "reload"], confirm=True),
-    Item("3", "Restart nginx", ["nginx", "restart"], confirm=True),
-    Item("4", "Show detected modules", ["nginx", "modules"]),
-    Item("5", "Service status", ["nginx", "status"]),
-    Item("0", "Back to main menu", back=True),
-]
-
-HEALTH_MENU = [
-    Item("1", "Probe all targets", ["health", "check"]),
-    Item("2", "Apply failover state", ["health", "failover"], confirm=True),
+    Item("2", "Show detected modules", ["nginx", "modules"]),
+    Item("3", "Service status", ["nginx", "status"]),
+    Item("4", "Reload nginx", ["nginx", "reload"], confirm=True),
+    Item("5", "Restart nginx", ["nginx", "restart"], confirm=True),
     Item("0", "Back to main menu", back=True),
 ]
 
 MAIN_MENU = [
-    Item("1", "Status — nginx, objects, snapshots", ["status"]),
-    Item("2", "Validate configuration", ["validate"]),
-    Item("3", "Generate fragments (dry run)", ["generate", "--dry-run"]),
-    Item("4", "Generate fragments to a directory", ["generate", "--dry-run"], prompt=_prompt_output_dir),
+    Item("1", "Build a configuration (guided wizard)", submenu=WIZARD_MENU),
+    Item("2", "Status — nginx, objects, snapshots", ["status"]),
+    Item("3", "Validate configuration", ["validate"]),
+    Item("4", "Generate fragments (dry run)", ["generate", "--dry-run"]),
     Item("5", "Apply — validate, generate, test, deploy", ["apply"], confirm=True),
     Item("6", "Rollback to a previous snapshot", ["rollback"], prompt=_prompt_snapshot, confirm=True),
-    Item("7", "Routes — list", ["routes", "list"]),
-    Item("8", "Routes — simulate a request", ["routes", "test"], prompt=_prompt_request),
-    Item("9", "Backends — list", ["backends", "list"]),
-    Item("t", "Tunnels", submenu=TUNNEL_MENU),
-    Item("n", "Nginx", submenu=NGINX_MENU),
-    Item("h", "Health checks and failover", submenu=HEALTH_MENU),
-    Item("i", "Initialise a starter configuration", ["init"], prompt=_prompt_init),
+    Item("7", "Routes — list / simulate", submenu=ROUTES_MENU),
+    Item("8", "Backends, tunnels, health", submenu=OBJECTS_MENU),
+    Item("9", "Nginx operations", submenu=NGINX_MENU),
     Item("u", "Update pg-router from git", ["update"], confirm=True),
     Item("0", "Quit", back=True),
 ]

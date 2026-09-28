@@ -115,7 +115,9 @@ def test_uninstall_invokes_script_with_flags(tmp_path, monkeypatch, argv, expect
     cli = CLI(_build_args(argv, monkeypatch))
     result = cli._uninstall()
     assert result["uninstalled"] is True
-    assert runs == [[str(root / "uninstall.sh")] + expected_flags]
+    # The script is executed via bash, not by path, so a missing executable bit
+    # cannot raise PermissionError (the failure seen on the server).
+    assert runs == [["bash", str(root / "uninstall.sh")] + expected_flags]
 
 
 def test_uninstall_without_script_errors_cleanly(tmp_path, monkeypatch):

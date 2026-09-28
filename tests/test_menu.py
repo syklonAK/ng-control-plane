@@ -68,16 +68,16 @@ def test_menu_yes_flag_skips_confirmation(monkeypatch):
 
 
 def test_menu_submenus_round_trip():
-    code, lines = script_menu(["--config", EXAMPLE], ["t", "1", "", "0", "0"])
+    code, lines = script_menu(["--config", EXAMPLE], ["8", "1", "", "0", "0"])
     assert code == 0
     joined = "\n".join(lines)
-    assert "List configured tunnels" in joined
+    assert "List backends" in joined
     assert "$ pg-router --config" in joined
 
 
 def test_menu_routes_test_prompt_collects_fields(capsys):
     code, lines = script_menu(
-        ["--config", EXAMPLE, "--json"], ["8", "example.com", "/nl/10000", "", "", "", "", "", "", "", "0"]
+        ["--config", EXAMPLE, "--json"], ["7", "2", "example.com", "/nl/10000", "", "", "", "", "", "", "", "0"]
     )
     assert code == 0
     assert "$ pg-router --config" in "\n".join(lines)

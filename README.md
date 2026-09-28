@@ -99,6 +99,26 @@ and hands it to the same code path the scripted commands use, so nothing the
 menu can do is impossible from a shell — and scripted use is unaffected (no
 terminal ⇒ usage is printed and the exit code is `2`).
 
+## Configuration wizard
+
+If you don't want to hand-write YAML, the wizard walks through one section at a
+time with validated defaults:
+
+```bash
+pg-router wizard --preset entry    # edge server: listener → route → backend
+pg-router wizard --preset exit     # backend server: tunnel → local backend
+pg-router wizard --preset custom --sections listener backend route
+```
+
+Each section asks only for what it needs and refuses values the schema would
+reject (bad ports, unknown transports). It works on an existing file too — run
+it again to add another listener or backend, and everything you already wrote
+stays untouched. The result is an ordinary configuration file, so `validate`
+and `apply` work on it unchanged.
+
+The same wizard is reachable from the interactive menu: **Build a
+configuration**.
+
 ## Quick start
 
 ```bash
@@ -186,10 +206,10 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Tests
 
 ```bash
-python -m pytest            # 164 tests: schema, matchers, validators, loops,
+python -m pytest            # 186 tests: schema, matchers, validators, loops,
                             # http/stream generation, tunnels, deploy/rollback,
                             # health/failover, installer, CLI, interactive menu,
-                            # update/uninstall script discovery, end-to-end
+                            # guided wizard, update/uninstall, end-to-end
 ```
 
 ## Environment variables
