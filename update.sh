@@ -29,6 +29,20 @@ if [[ "$(id -u)" -ne 0 ]]; then
     exit 1
 fi
 
+# Two updates at once would race on the venv and leave a half-written install.
+# flock is optional: where it is missing (some containers, WSL1, BusyBox) the
+# update still runs, just without the concurrency guard.
+LOCK_FILE="/var/run/pg-router-update.lock"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"${LOCK_FILE}"
+    if ! flock -n 9; then
+        echo "[ERROR] another pg-router update is already running" >&2
+        exit 1
+    fi
+else
+    echo "[WARNING] flock not found; running without an update lock" >&2
+fi
+
 echo "[INFO] pg-router updater — source: ${SRC_DIR}"
 
 # ---------------------------------------------------------------- up-to-date check
@@ -48,7 +62,10 @@ echo "       remote ${REMOTE_REV:0:12}"
 
 # ---------------------------------------------------------------- apply update
 git -C "${SRC_DIR}" reset --quiet --hard "origin/${BRANCH}"
-git -C "${SRC_DIR}" clean --quiet -fd
+# -fd removes untracked files; the exclusions keep a developer's local config
+# and any yaml lying next to the checkout. Ignored directories (venv/) are
+# preserved automatically.
+git -C "${SRC_DIR}" clean --quiet -fd -e "*.yaml" -e "*.yml" -e "venv"
 
 VENV_DIR="${SRC_DIR}/venv"
 if [[ ! -d "${VENV_DIR}" ]]; then
@@ -56,17 +73,24 @@ if [[ ! -d "${VENV_DIR}" ]]; then
     python3 -m venv "${VENV_DIR}"
 fi
 
+VENV_PY="${VENV_DIR}/bin/python"
+VENV_BIN="${VENV_DIR}/bin/pg-router"
+
 echo "[INFO] reinstalling dependencies"
-"${VENV_DIR}/bin/python" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
-# --force-reinstall guarantees the entry point reflects the new source tree.
-"${VENV_DIR}/bin/python" -m pip install --quiet --no-cache-dir --force-reinstall "${SRC_DIR}"
+"${VENV_PY}" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
+# Refresh this package only, then let pip reconcile dependencies: a single
+# --force-reinstall would rebuild PyYAML and every wheel on every update.
+"${VENV_PY}" -m pip install --quiet --no-cache-dir --no-deps --force-reinstall "${SRC_DIR}"
+"${VENV_PY}" -m pip install --quiet --no-cache-dir "${SRC_DIR}"
 
-ln -sf "${VENV_DIR}/bin/pg-router" "${BIN_LINK}"
-
-if ! "${BIN_LINK}" --version >/dev/null 2>&1; then
-    echo "[ERROR] post-update verification failed" >&2
+# Verify the new code through the venv *before* touching the live symlink, so
+# a failed build leaves the working CLI in place instead of a dead link.
+if ! "${VENV_BIN}" --version >/dev/null 2>&1; then
+    echo "[ERROR] new version failed verification; the existing CLI was left untouched" >&2
     exit 1
 fi
+
+ln -sf "${VENV_BIN}" "${BIN_LINK}"
 
 echo "[INFO] updated to $( "${BIN_LINK}" --version 2>&1 ) (${REMOTE_REV:0:12})"
 

@@ -55,8 +55,7 @@ if [[ -L "${BIN_LINK}" ]]; then
         rm -f "${BIN_LINK}"
         echo "[INFO] removed ${BIN_LINK}"
     else
-        echo "[INFO] keeping CLI symlink; aborting"
-        exit 0
+        echo "[INFO] keeping CLI symlink; the shell command stays available"
     fi
 else
     echo "[INFO] no CLI symlink at ${BIN_LINK}"

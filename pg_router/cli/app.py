@@ -296,7 +296,9 @@ class CLI:
         # reinstall. Output is streamed because the updater is interactive and
         # prints its own [INFO] progress lines.
         script = _find_shipped_script("update.sh")
-        _run_script(script, [])
+        code = _run_script(script, [])
+        if code != 0:
+            raise CommandError(f"updater exited with code {code}: {script}")
         return {"updated": True, "script": str(script)}
 
     def _uninstall(self):
@@ -308,7 +310,9 @@ class CLI:
             extra.append("--yes")
         if self.args.purge:
             extra.append("--purge")
-        _run_script(script, extra)
+        code = _run_script(script, extra)
+        if code != 0:
+            raise CommandError(f"uninstaller exited with code {code}: {script}")
         return {"uninstalled": True, "script": str(script)}
 
     def _menu(self):
@@ -364,7 +368,7 @@ def _find_shipped_script(name: str) -> Path:
     )
 
 
-def _run_script(script: Path, extra: list[str]) -> None:
+def _run_script(script: Path, extra: list[str]) -> int:
     """Execute a shipped shell script.
 
     Always via ``bash <script>``, never the path directly: git clones may hold
@@ -372,18 +376,32 @@ def _run_script(script: Path, extra: list[str]) -> None:
     it), and this is the failure that produced PermissionError on the server.
     ``shell=False`` still holds — the script path is an argv element, not a
     string evaluated by a shell.
+
+    Returns the script's exit code so callers can report failure honestly
+    instead of always claiming success.
     """
-    argv = [_shell(), str(script)] + [str(item) for item in extra]
+    argv = [*_shell(), str(script)] + [str(item) for item in extra]
     _log.info("running %s", " ".join(argv))
-    subprocess.run(argv, check=False, shell=False)
+    return subprocess.run(argv, check=False, shell=False).returncode
 
 
-def _shell() -> str:
-    """A bash capable of running the shipped scripts."""
-    for candidate in ("/usr/bin/env bash", "/bin/bash", "/usr/bin/bash"):
-        if Path(candidate.split()[0]).exists():
-            return candidate
-    return "bash"
+def _shell() -> list[str]:
+    """A bash argv prefix capable of running the shipped scripts.
+
+    ``/usr/bin/env bash`` is preferred because it works even when bash lives
+    outside the well-known paths; the plain paths are fallbacks. Each candidate
+    is returned as a list — ``["/usr/bin/env", "bash"]`` is two argv elements,
+    while joining them into one string would make subprocess look for a file
+    literally named ``/usr/bin/env bash`` (which does not exist).
+    """
+    for executable, arguments in (
+        ("/usr/bin/env", ["bash"]),
+        ("/bin/bash", []),
+        ("/usr/bin/bash", []),
+    ):
+        if Path(executable).exists():
+            return [executable, *arguments]
+    return ["bash"]
 
 
 def _global_argv(args: argparse.Namespace) -> list[str]:

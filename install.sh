@@ -64,6 +64,14 @@ if ! python3 -m venv /tmp/pg-router-venvcheck >/dev/null 2>&1; then
     elif command -v apk >/dev/null 2>&1; then apk add --quiet py3-virtualenv
     else echo "[ERROR] cannot install venv support on this system" >&2; exit 1
     fi
+    # Re-test after installing: python3-venv can still be unavailable when the
+    # ensurepip wheel package is missing (Debian strips it sometimes).
+    if ! python3 -m venv /tmp/pg-router-venvcheck >/dev/null 2>&1; then
+        rm -rf /tmp/pg-router-venvcheck
+        echo "[ERROR] python3 -m venv still fails after installing python3-venv" >&2
+        echo "[ERROR] on Debian try: apt-get install -y python3.12-venv (match your python version)" >&2
+        exit 1
+    fi
 fi
 rm -rf /tmp/pg-router-venvcheck
 
@@ -72,7 +80,7 @@ if [[ -d "${INSTALL_DIR}/.git" ]]; then
     echo "[INFO] updating existing installation"
     git -C "${INSTALL_DIR}" fetch --quiet --force origin "${BRANCH}"
     git -C "${INSTALL_DIR}" reset --quiet --hard "origin/${BRANCH}"
-    git -C "${INSTALL_DIR}" clean --quiet -fd
+    git -C "${INSTALL_DIR}" clean --quiet -fd -e "*.yaml" -e "*.yml" -e "venv"
 else
     echo "[INFO] cloning fresh installation"
     mkdir -p "$(dirname "${INSTALL_DIR}")"

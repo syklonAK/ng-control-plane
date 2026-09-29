@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
-from pg_router.cli.app import CLI, _find_shipped_script, _global_argv
+from pg_router.cli.app import CLI, _find_shipped_script, _global_argv, _shell
 from pg_router.utils.system import CommandError
+
+
+class _Completed:
+    """Stand-in for subprocess.CompletedProcess used by the patched run."""
+
+    returncode = 0
 
 
 @pytest.fixture
@@ -110,14 +117,21 @@ def test_uninstall_invokes_script_with_flags(tmp_path, monkeypatch, argv, expect
     monkeypatch.delenv("PG_ROUTER_HOME", raising=False)
 
     runs: list[list[str]] = []
-    monkeypatch.setattr("pg_router.cli.app.subprocess.run", lambda cmd, **kw: runs.append(cmd))
+    monkeypatch.setattr(
+        "pg_router.cli.app.subprocess.run",
+        lambda cmd, **kw: runs.append(cmd) or _Completed(),
+    )
 
     cli = CLI(_build_args(argv, monkeypatch))
     result = cli._uninstall()
     assert result["uninstalled"] is True
     # The script is executed via bash, not by path, so a missing executable bit
-    # cannot raise PermissionError (the failure seen on the server).
-    assert runs == [["bash", str(root / "uninstall.sh")] + expected_flags]
+    # cannot raise PermissionError (the failure seen on the server). The bash
+    # prefix may be one or two argv elements depending on the host, so it is
+    # resolved from the helper rather than hard-coded here.
+    shell_prefix = _shell()
+    expected = [*shell_prefix, str(root / "uninstall.sh")] + expected_flags
+    assert runs == [expected]
 
 
 def test_uninstall_without_script_errors_cleanly(tmp_path, monkeypatch):
@@ -145,3 +159,50 @@ def test_global_argv_roundtrip():
         "--json",
         "--yes",
     ]
+
+
+# ---------------------------------------------------------------------------
+# script execution
+# ---------------------------------------------------------------------------
+
+
+def test_shell_returns_argv_list_not_one_string():
+    # "/usr/bin/env bash" is two argv elements; joining them into one string
+    # would make subprocess look for a file literally named that.
+    prefix = _shell()
+    assert isinstance(prefix, list)
+    assert all(isinstance(part, str) for part in prefix)
+    assert len(prefix) >= 1
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="the shipped scripts target Linux servers; no bash on this host",
+)
+def test_run_script_reports_nonzero_exit(tmp_path):
+    """A failing updater must surface an error, not report success."""
+    from pg_router.cli.app import _run_script
+
+    script = tmp_path / "fail.sh"
+    script.write_text("#!/usr/bin/env bash\nexit 7\n", encoding="utf-8")
+    code = _run_script(script, ["--yes"])
+    assert code == 7
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="the shipped scripts target Linux servers; no bash on this host",
+)
+def test_update_command_raises_on_updater_failure(tmp_path, monkeypatch):
+    root = tmp_path / "checkout"
+    (root / "pg_router/cli").mkdir(parents=True)
+    (root / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (root / "update.sh").write_text("#!/usr/bin/env bash\nexit 3\n", encoding="utf-8")
+    monkeypatch.setattr("pg_router.cli.app.__file__", str(root / "pg_router/cli/app.py"))
+    monkeypatch.delenv("PG_ROUTER_HOME", raising=False)
+
+    args = _build_args([], monkeypatch)
+    args.command = "update"
+    cli = CLI(args)
+    with pytest.raises(CommandError, match="exit code 3"):
+        cli._update()
