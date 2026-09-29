@@ -69,8 +69,24 @@ git -C "${SRC_DIR}" clean --quiet -fd -e "*.yaml" -e "*.yml" -e "venv"
 
 VENV_DIR="${SRC_DIR}/venv"
 if [[ ! -d "${VENV_DIR}" ]]; then
-    echo "[INFO] creating virtualenv"
-    python3 -m venv "${VENV_DIR}"
+    # Mirror the installer's interpreter search: the system 'python3' may be
+    # older than 3.10 even when a newer interpreter is installed alongside it.
+    PY=""
+    for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
+        if command -v "${candidate}" >/dev/null 2>&1; then
+            if "${candidate}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+                PY="${candidate}"
+                break
+            fi
+        fi
+    done
+    if [[ -z "${PY}" ]]; then
+        echo "[ERROR] no python 3.10+ found to rebuild the virtualenv" >&2
+        echo "[ERROR] run the installer again: curl -fsSL <install.sh> | sudo bash" >&2
+        exit 1
+    fi
+    echo "[INFO] creating virtualenv with ${PY}"
+    "${PY}" -m venv "${VENV_DIR}"
 fi
 
 VENV_PY="${VENV_DIR}/bin/python"

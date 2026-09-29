@@ -13,8 +13,6 @@ BRANCH="${PG_ROUTER_BRANCH:-main}"
 INSTALL_DIR="${PG_ROUTER_HOME:-/opt/pg-router}"
 VENV_DIR="${INSTALL_DIR}/venv"
 BIN_LINK="/usr/local/bin/pg-router"
-PY_MIN_MAJOR=3
-PY_MIN_MINOR=10
 
 if [[ "$(id -u)" -ne 0 ]]; then
     echo "[ERROR] installer must run as root (prefix with sudo)" >&2
@@ -35,41 +33,92 @@ if ! command -v git >/dev/null 2>&1; then
     fi
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "[INFO] installing python3"
-    if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq python3 python3-venv python3-pip
-    elif command -v dnf >/dev/null 2>&1; then dnf install -y -q python3 python3-devel
-    elif command -v yum >/dev/null 2>&1; then yum install -y -q python3
-    elif command -v apk >/dev/null 2>&1; then apk add --quiet python3 py3-pip
-    else echo "[ERROR] no supported package manager to install python3" >&2; exit 1
+# ---------------------------------------------------------------- python
+# Pick any interpreter that is new enough. python3 might be old (Debian/Ubuntu
+# ship an older default) while python3.10+ is already installed alongside it,
+# so prefer an explicit version over the bare name.
+PY=""
+for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
+    if command -v "${candidate}" >/dev/null 2>&1; then
+        if "${candidate}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+            PY="${candidate}"
+            break
+        fi
+    fi
+done
+
+if [[ -z "${PY}" ]]; then
+    echo "[INFO] no suitable python found; trying to install one"
+
+    # Try versioned packages directly, then (on Ubuntu) the deadsnakes PPA,
+    # which carries modern interpreters for releases whose default 'python3'
+    # is too old (e.g. Ubuntu 20.04 ships 3.8).
+    try_apt_python() {
+        for pk in python3.13 python3.12 python3.11 python3.10; do
+            if apt-get install -y -qq "${pk}" "${pk}-venv" >/dev/null 2>&1; then
+                PY="${pk}"
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq
+        if ! try_apt_python; then
+            # shellcheck disable=SC1091
+            if [[ -f /etc/os-release ]] && . /etc/os-release && [[ "${ID:-}" == "ubuntu" ]]; then
+                echo "[INFO] enabling deadsnakes PPA for a modern python"
+                apt-get install -y -qq software-properties-common >/dev/null 2>&1 || true
+                add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 || true
+                apt-get update -qq
+                try_apt_python || true
+            fi
+        fi
+    elif command -v dnf >/dev/null 2>&1; then
+        for pk in python3.13 python3.12 python3.11; do
+            if dnf install -y -q "${pk}" >/dev/null 2>&1; then
+                PY="${pk}"
+                break
+            fi
+        done
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q python3 || true
+        PY=python3
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --quiet python3 py3-pip || true
+        PY=python3
     fi
 fi
 
-PY_VER_MAJOR="$(python3 -c 'import sys; print(sys.version_info[0])')"
-PY_VER_MINOR="$(python3 -c 'import sys; print(sys.version_info[1])')"
-if [[ "${PY_VER_MAJOR}" -lt "${PY_MIN_MAJOR}" || \
-      ( "${PY_VER_MAJOR}" -eq "${PY_MIN_MAJOR}" && "${PY_VER_MINOR}" -lt "${PY_MIN_MINOR}" ) ]]; then
-    echo "[ERROR] python ${PY_MIN_MAJOR}.${PY_MIN_MINOR}+ required, found ${PY_VER_MAJOR}.${PY_VER_MINOR}" >&2
+if [[ -z "${PY}" ]] || ! command -v "${PY}" >/dev/null 2>&1; then
+    echo "[ERROR] python 3.10+ required and could not be installed" >&2
+    echo "[ERROR] install it manually (e.g. apt-get install python3.12 python3.12-venv) and re-run" >&2
     exit 1
 fi
-echo "[INFO] python: $(python3 -V 2>&1)"
 
-# Debian/Ubuntu ship python3 without the venv module unless python3-venv is
+if ! "${PY}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    echo "[ERROR] python 3.10+ required, found $( "${PY}" -V 2>&1 )" >&2
+    exit 1
+fi
+echo "[INFO] python: $( "${PY}" -V 2>&1 )"
+
+# Debian/Ubuntu ship python without the venv module unless pythonX.Y-venv is
 # installed. Create a throwaway venv to detect that before relying on it.
-if ! python3 -m venv /tmp/pg-router-venvcheck >/dev/null 2>&1; then
-    echo "[INFO] python venv module missing; installing python3-venv"
+if ! "${PY}" -m venv /tmp/pg-router-venvcheck >/dev/null 2>&1; then
+    echo "[INFO] python venv module missing; installing venv support"
     rm -rf /tmp/pg-router-venvcheck
-    if command -v apt-get >/dev/null 2>&1; then apt-get install -y -qq python3-venv python3-pip
+    if command -v apt-get >/dev/null 2>&1; then apt-get install -y -qq "${PY}-venv" python3-pip
     elif command -v dnf >/dev/null 2>&1; then dnf install -y -q python3-devel
     elif command -v apk >/dev/null 2>&1; then apk add --quiet py3-virtualenv
     else echo "[ERROR] cannot install venv support on this system" >&2; exit 1
     fi
     # Re-test after installing: python3-venv can still be unavailable when the
     # ensurepip wheel package is missing (Debian strips it sometimes).
-    if ! python3 -m venv /tmp/pg-router-venvcheck >/dev/null 2>&1; then
+    if ! "${PY}" -m venv /tmp/pg-router-venvcheck >/dev/null 2>&1; then
         rm -rf /tmp/pg-router-venvcheck
-        echo "[ERROR] python3 -m venv still fails after installing python3-venv" >&2
-        echo "[ERROR] on Debian try: apt-get install -y python3.12-venv (match your python version)" >&2
+        echo "[ERROR] ${PY} -m venv still fails after installing venv support" >&2
+        echo "[ERROR] on Debian try: apt-get install -y ${PY}-venv" >&2
         exit 1
     fi
 fi
@@ -90,8 +139,8 @@ fi
 
 # ---------------------------------------------------------------- venv + install
 if [[ ! -d "${VENV_DIR}" ]]; then
-    echo "[INFO] creating virtualenv"
-    python3 -m venv "${VENV_DIR}"
+    echo "[INFO] creating virtualenv with ${PY}"
+    "${PY}" -m venv "${VENV_DIR}"
 fi
 
 echo "[INFO] installing python dependencies"

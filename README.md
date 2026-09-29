@@ -29,6 +29,11 @@ One line (installs into `/opt/pg-router`, creates an isolated venv, links the CL
 curl -fsSL https://raw.githubusercontent.com/syklonAK/ng-control-plane/main/install.sh | sudo bash
 ```
 
+The installer never depends on the system `python3` version: it picks any
+interpreter ≥ 3.10 already present and, when none exists, installs one itself
+(versioned distro package, or the deadsnakes PPA on older Ubuntu releases whose
+default is 3.8). Requirements are only `root` and `git`.
+
 Or from a checkout:
 
 ```bash
