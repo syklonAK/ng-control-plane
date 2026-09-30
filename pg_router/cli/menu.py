@@ -95,6 +95,60 @@ def _wizard_argv(menu: "Menu", extra: list[str]) -> list[str]:
     return argv + extra
 
 
+def _prompt_config_show(menu: "Menu") -> list[str]:
+    return _with_config(menu, ["show"])
+
+
+def _prompt_config_edit(menu: "Menu") -> list[str]:
+    return _with_config(menu, ["edit"])
+
+
+def _prompt_config_copy(menu: "Menu") -> list[str]:
+    destination = menu.ask("Destination file for the copy")
+    if not destination:
+        menu._write("No destination given; nothing copied.")
+        return []
+    # "copy" takes its source first and the destination last, so the config the
+    # menu was opened with goes before the destination, not after it.
+    config = _flag_value(menu.base_argv, "--config", "-c")
+    argv = ["config", "copy"]
+    if config:
+        argv += [config]
+    return argv + [destination]
+
+
+def _prompt_config_delete(menu: "Menu") -> list[str]:
+    return _with_config(menu, ["delete", "--yes"])
+
+
+def _prompt_config_use(menu: "Menu") -> list[str]:
+    path = menu.ask("Path to the configuration file to make active")
+    if not path:
+        menu._write("No path given; nothing changed.")
+        return []
+    return ["config", "use", path]
+
+
+def _with_config(menu: "Menu", extra: list[str]) -> list[str]:
+    """Address the config file the menu was opened with, when there is one."""
+    config = _flag_value(menu.base_argv, "--config", "-c")
+    argv = ["config"] + extra
+    if config and extra and extra[0] != "use":
+        argv += [config]
+    return argv
+
+
+CONFIG_MENU = [
+    Item("1", "List known configuration files", ["config", "list"]),
+    Item("2", "Show the active configuration", [], prompt=_prompt_config_show),
+    Item("3", "Edit the active configuration ($EDITOR, validated)", [], prompt=_prompt_config_edit),
+    Item("4", "Copy the active configuration to a new file", [], prompt=_prompt_config_copy),
+    Item("5", "Make another file the active configuration", [], prompt=_prompt_config_use),
+    Item("6", "Delete the active configuration *", [], prompt=_prompt_config_delete, confirm=True),
+    Item("0", "Back to main menu", back=True),
+]
+
+
 ROUTES_MENU = [
     Item("1", "List routes", ["routes", "list"]),
     Item("2", "Simulate a request", ["routes", "test"], prompt=_prompt_request),
@@ -128,14 +182,15 @@ NGINX_MENU = [
 
 MAIN_MENU = [
     Item("1", "Build a configuration (guided wizard)", submenu=WIZARD_MENU),
-    Item("2", "Status — nginx, objects, snapshots", ["status"]),
-    Item("3", "Validate configuration", ["validate"]),
-    Item("4", "Generate fragments (dry run)", ["generate", "--dry-run"]),
-    Item("5", "Apply — validate, generate, test, deploy", ["apply"], confirm=True),
-    Item("6", "Rollback to a previous snapshot", ["rollback"], prompt=_prompt_snapshot, confirm=True),
-    Item("7", "Routes — list / simulate", submenu=ROUTES_MENU),
-    Item("8", "Backends, tunnels, health", submenu=OBJECTS_MENU),
-    Item("9", "Nginx operations", submenu=NGINX_MENU),
+    Item("2", "Configuration files — show / edit / copy / delete", submenu=CONFIG_MENU),
+    Item("3", "Status — nginx, objects, snapshots", ["status"]),
+    Item("4", "Validate configuration", ["validate"]),
+    Item("5", "Generate fragments (dry run)", ["generate", "--dry-run"]),
+    Item("6", "Apply — validate, generate, test, deploy", ["apply"], confirm=True),
+    Item("7", "Rollback to a previous snapshot", ["rollback"], prompt=_prompt_snapshot, confirm=True),
+    Item("8", "Routes — list / simulate", submenu=ROUTES_MENU),
+    Item("9", "Backends, tunnels, health", submenu=OBJECTS_MENU),
+    Item("n", "Nginx operations", submenu=NGINX_MENU),
     Item("u", "Update pg-router from git", ["update"], confirm=True),
     Item("0", "Quit", back=True),
 ]

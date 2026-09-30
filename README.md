@@ -91,27 +91,60 @@ $ pg-router -c /etc/pg-router/config.yaml
 pg-router 1.0.0 — interactive menu
 config: /etc/pg-router/config.yaml
 
-  1) Status — nginx, objects, snapshots
-  2) Validate configuration
-  3) Generate fragments (dry run)
-  4) Generate fragments to a directory
- *5) Apply — validate, generate, test, deploy
- *6) Rollback to a previous snapshot
-  7) Routes — list
-  8) Routes — simulate a request
-  9) Backends — list
-  t) Tunnels
-  n) Nginx
-  h) Health checks and failover
-  i) Initialise a starter configuration
+  1) Build a configuration (guided wizard)
+  2) Configuration files — show / edit / copy / delete
+  3) Status — nginx, objects, snapshots
+  4) Validate configuration
+  5) Generate fragments (dry run)
+ *6) Apply — validate, generate, test, deploy
+ *7) Rollback to a previous snapshot
+  8) Routes — list / simulate
+  9) Backends, tunnels, health
+  n) Nginx operations
  *u) Update pg-router from git
   0) Quit
 ```
 
-Entries marked `*` ask for confirmation. The menu only builds an argument list
-and hands it to the same code path the scripted commands use, so nothing the
-menu can do is impossible from a shell — and scripted use is unaffected (no
-terminal ⇒ usage is printed and the exit code is `2`).
+Entries marked `*` ask for confirmation. Entries with submenus (wizard,
+configuration files, routes, backends, nginx) descend a level and `0` comes
+back. The menu only builds an argument list and hands it to the same code path
+the scripted commands use, so nothing the menu can do is impossible from a
+shell — and scripted use is unaffected (no terminal ⇒ usage is printed and the
+exit code is `2`).
+
+## Configuration file management
+
+The wizard *creates* a configuration; `config` looks after the file
+afterwards — without hand-editing YAML blind or remembering long paths:
+
+```bash
+pg-router config list                     # known files, which one is active
+pg-router config show                     # print the active configuration
+pg-router config show /path/to/other.yaml # print a specific one
+pg-router config edit                     # open it in $EDITOR, then validate
+pg-router config edit --no-validate       # edit without refusing a bad result
+pg-router config copy /etc/pg-router/prod.yaml /backup/prod.yaml
+pg-router config use /etc/pg-router/prod.yaml   # remember it, skip -c from now on
+pg-router config forget                   # stop remembering
+pg-router config delete /etc/pg-router/old.yaml --yes
+```
+
+`use` makes `-c` optional: once a file is selected, plain `pg-router status`,
+`validate` or `apply` all operate on it (override per command with `-c`, or
+globally with `PG_ROUTER_CONFIG`).
+
+Every mutating operation is safe by default:
+
+- `edit` keeps a `.bak` copy before the editor runs and validates the result
+  afterwards; an invalid file leaves the command failing loudly (exit `1`) and
+  the previous content recoverable in the backup.
+- `copy` is byte-exact, so comments and hand formatting survive, and refuses to
+  overwrite an existing file.
+- `delete` requires `--yes` and still writes a `.bak` backup.
+- `use` refuses to select a file that does not validate.
+
+The same operations are reachable from the interactive menu: **Configuration
+files**.
 
 ## Configuration wizard
 
@@ -220,10 +253,11 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Tests
 
 ```bash
-python -m pytest            # 186 tests: schema, matchers, validators, loops,
+python -m pytest            # 198 tests: schema, matchers, validators, loops,
                             # http/stream generation, tunnels, deploy/rollback,
                             # health/failover, installer, CLI, interactive menu,
                             # guided wizard, update/uninstall, end-to-end
+                            # (plus installer shell scenarios run under bash)
 ```
 
 ## Environment variables
@@ -234,6 +268,7 @@ python -m pytest            # 186 tests: schema, matchers, validators, loops,
 | `PG_ROUTER_DATA_DIR` | Managed fragment directory (default `/etc/nginx/pg-router`) |
 | `PG_ROUTER_LOG_LEVEL` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
 | `PG_ROUTER_MENU` | Force the interactive menu on even when stdin is not a terminal |
+| `PG_ROUTER_STATE_DIR` | Where `config use` remembers the active configuration (default `~/.pg-router`) |
 | `PG_ROUTER_API_BIND` | Reserved for the future API server |
 
 Secrets never need to live in YAML: `${VAR}` and `${VAR:-default}` placeholders

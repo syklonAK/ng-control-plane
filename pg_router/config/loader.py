@@ -28,6 +28,88 @@ DEFAULT_CONFIG_PATHS = (
     "/etc/pg-router/config.yaml",
 )
 
+# Where the "active" configuration is remembered between invocations, so that
+# `-c` is only needed once. PG_ROUTER_STATE_DIR overrides the location.
+STATE_DIR = Path(
+    os.environ.get("PG_ROUTER_STATE_DIR") or os.path.expanduser("~/.pg-router")
+)
+ACTIVE_CONFIG_FILE = STATE_DIR / "active_config"
+
+# Databases are never written here; this is only used to back up a file before
+# an interactive edit overwrites it.
+EDIT_BACKUP_SUFFIX = ".bak"
+
+
+def remembered_config_path() -> Optional[Path]:
+    """The configuration remembered by ``config use``, if it still exists."""
+    try:
+        text = ACTIVE_CONFIG_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    path = Path(text)
+    return path if path.is_file() else None
+
+
+def remember_config(path: str | Path) -> Path:
+    """Persist ``path`` as the active configuration."""
+    target = Path(path).resolve()
+    ACTIVE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ACTIVE_CONFIG_FILE.write_text(f"{target}\n", encoding="utf-8")
+    return target
+
+
+def forget_config() -> bool:
+    """Stop remembering an active configuration. True if something was cleared."""
+    try:
+        ACTIVE_CONFIG_FILE.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def list_config_files(explicit: Optional[str | Path] = None) -> list[dict[str, Any]]:
+    """Configuration files in the well-known locations, best match first.
+
+    ``explicit`` is the path given through ``-c``/``PG_ROUTER_CONFIG``;
+    ``active`` marks the file the next invocation without ``-c`` will load.
+    """
+    try:
+        active = _resolve_path(explicit)
+    except ValidationError:
+        active = None
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    remembered = remembered_config_path()
+    if remembered is not None:
+        candidates.append(remembered)
+    env_path = os.environ.get("PG_ROUTER_CONFIG")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.extend(Path(candidate) for candidate in DEFAULT_CONFIG_PATHS)
+    for pattern in ("*.yaml", "*.yml"):
+        candidates.extend(sorted(Path("/etc/pg-router").glob(pattern)))
+
+    seen: set[str] = set()
+    entries: list[dict[str, Any]] = []
+    for candidate in candidates:
+        key = str(candidate.resolve() if candidate.exists() else candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        exists = candidate.is_file()
+        entries.append(
+            {
+                "path": str(candidate),
+                "exists": exists,
+                "size": candidate.stat().st_size if exists else None,
+                "active": active is not None and candidate.resolve() == active.resolve(),
+            }
+        )
+    return entries
+
 
 def substitute_env(value: Any) -> Any:
     """Recursively expand ``${VAR}`` / ``${VAR:-default}`` placeholders."""
@@ -100,6 +182,9 @@ def _resolve_path(path: Optional[str | Path]) -> Path:
     env_path = os.environ.get("PG_ROUTER_CONFIG")
     if env_path:
         return Path(env_path)
+    remembered = remembered_config_path()
+    if remembered is not None:
+        return remembered
     for candidate in DEFAULT_CONFIG_PATHS:
         if Path(candidate).exists():
             return Path(candidate)
@@ -107,6 +192,14 @@ def _resolve_path(path: Optional[str | Path]) -> Path:
         "No configuration file found. Pass a path, set PG_ROUTER_CONFIG, "
         f"or create one of: {', '.join(DEFAULT_CONFIG_PATHS)}"
     )
+
+
+def resolve_path(path: Optional[str | Path] = None) -> Path:
+    """The configuration file that would be loaded, without reading it.
+
+    Raises :class:`ValidationError` when nothing resolves.
+    """
+    return _resolve_path(path)
 
 
 def write_config(path: str | Path, data: dict[str, Any]) -> None:

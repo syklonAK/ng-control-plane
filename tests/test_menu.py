@@ -33,7 +33,7 @@ EXAMPLE = str(Path(__file__).resolve().parent.parent / "examples" / "edge-mixed.
 
 
 def test_menu_runs_validate_and_quits(capsys):
-    code, lines = script_menu(["--config", EXAMPLE], ["2", "", "0"])
+    code, lines = script_menu(["--config", EXAMPLE], ["4", "", "0"])
     assert code == 0
     joined = "\n".join(lines)
     assert "interactive menu" in joined
@@ -43,14 +43,14 @@ def test_menu_runs_validate_and_quits(capsys):
 
 
 def test_menu_reports_invalid_choice_and_recovers(capsys):
-    code, lines = script_menu(["--config", EXAMPLE], ["zzz", "2", "", "0"])
+    code, lines = script_menu(["--config", EXAMPLE], ["zzz", "4", "", "0"])
     assert code == 0
     assert any("Unknown choice 'zzz'" in line for line in lines)
     assert "valid: True" in capsys.readouterr().out
 
 
 def test_menu_dangerous_action_requires_confirmation():
-    code, lines = script_menu(["--config", EXAMPLE], ["5", "n", "", "0"])
+    code, lines = script_menu(["--config", EXAMPLE], ["6", "n", "", "0"])
     assert code == 0
     joined = "\n".join(lines)
     assert "Cancelled." in joined
@@ -60,7 +60,7 @@ def test_menu_dangerous_action_requires_confirmation():
 
 def test_menu_yes_flag_skips_confirmation(monkeypatch):
     monkeypatch.setattr("pg_router.cli.menu.Menu.confirm", lambda self, action: True)
-    code, lines = script_menu(["--config", EXAMPLE, "--yes"], ["5", "", "0"])
+    code, lines = script_menu(["--config", EXAMPLE, "--yes"], ["6", "", "0"])
     assert code == 0
     joined = "\n".join(lines)
     assert "Cancelled." not in joined
@@ -68,7 +68,7 @@ def test_menu_yes_flag_skips_confirmation(monkeypatch):
 
 
 def test_menu_submenus_round_trip():
-    code, lines = script_menu(["--config", EXAMPLE], ["8", "1", "", "0", "0"])
+    code, lines = script_menu(["--config", EXAMPLE], ["9", "1", "", "0", "0"])
     assert code == 0
     joined = "\n".join(lines)
     assert "List backends" in joined
@@ -77,7 +77,7 @@ def test_menu_submenus_round_trip():
 
 def test_menu_routes_test_prompt_collects_fields(capsys):
     code, lines = script_menu(
-        ["--config", EXAMPLE, "--json"], ["7", "2", "example.com", "/nl/10000", "", "", "", "", "", "", "", "0"]
+        ["--config", EXAMPLE, "--json"], ["8", "2", "example.com", "/nl/10000", "", "", "", "", "", "", "", "0"]
     )
     assert code == 0
     assert "$ pg-router --config" in "\n".join(lines)
@@ -86,7 +86,7 @@ def test_menu_routes_test_prompt_collects_fields(capsys):
 
 
 def test_menu_eof_exits_cleanly():
-    remaining = iter(["2"])
+    remaining = iter(["4"])
 
     def prompt(_question: str) -> str:
         return next(remaining)
@@ -94,6 +94,71 @@ def test_menu_eof_exits_cleanly():
     code = Menu(["--config", EXAMPLE], prompt=prompt, write=lambda *_: None).loop()
     # The pause prompt after validate hits StopIteration -> MenuExit -> 0.
     assert code == 0
+
+
+# ---------------------------------------------------------------------------
+# configuration-files submenu (main menu entry 2)
+# ---------------------------------------------------------------------------
+
+
+def _copy_example(target_dir: Path) -> Path:
+    """The menu mutates files, so tests never point it at the shipped example."""
+    target = target_dir / "active.yaml"
+    target.write_text(Path(EXAMPLE).read_text(encoding="utf-8"), encoding="utf-8")
+    return target
+
+
+def test_menu_config_submenu_lists_known_files(tmp_path: Path, capsys):
+    cfg = _copy_example(tmp_path)
+    code, lines = script_menu(["--config", str(cfg)], ["2", "1", "", "0", "0"])
+    assert code == 0
+    assert "Show the active configuration" in "\n".join(lines)
+    assert str(cfg) in capsys.readouterr().out
+
+
+def test_menu_config_submenu_shows_the_active_config(tmp_path: Path, capsys):
+    cfg = _copy_example(tmp_path)
+    code, lines = script_menu(["--config", str(cfg)], ["2", "2", "", "0", "0"])
+    assert code == 0
+    assert "$ pg-router --config" in "\n".join(lines)
+    assert "listeners:" in capsys.readouterr().out
+
+
+def test_menu_config_submenu_copies_to_a_new_file(tmp_path: Path, capsys):
+    cfg = _copy_example(tmp_path)
+    destination = tmp_path / "copied.yaml"
+    code, lines = script_menu(
+        ["--config", str(cfg)], ["2", "4", str(destination), "", "0", "0"]
+    )
+    assert code == 0
+    assert destination.is_file()
+    assert destination.read_text(encoding="utf-8") == cfg.read_text(encoding="utf-8")
+
+
+def test_menu_config_submenu_delete_needs_confirmation(tmp_path: Path):
+    cfg = _copy_example(tmp_path)
+    code, lines = script_menu(["--config", str(cfg)], ["2", "6", "n", "", "0", "0"])
+    assert code == 0
+    joined = "\n".join(lines)
+    assert "Cancelled." in joined
+    # Refusing the confirmation must leave the file untouched.
+    assert cfg.is_file()
+
+
+def test_menu_config_submenu_selects_another_active_config(tmp_path: Path, monkeypatch):
+    state = tmp_path / "state"
+    monkeypatch.setattr(
+        "pg_router.config.loader.ACTIVE_CONFIG_FILE", state / "active_config"
+    )
+    cfg = _copy_example(tmp_path)
+    other = tmp_path / "second.yaml"
+    other.write_text(cfg.read_text(encoding="utf-8"), encoding="utf-8")
+
+    code, _ = script_menu(["--config", str(cfg)], ["2", "5", str(other), "", "0", "0"])
+    assert code == 0
+    from pg_router.config.loader import remembered_config_path
+
+    assert remembered_config_path() == other.resolve()
 
 
 @pytest.mark.parametrize(

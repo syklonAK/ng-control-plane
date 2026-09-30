@@ -123,6 +123,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub.add_parser("menu", help="Interactive terminal menu")
 
+    cfg = sub.add_parser("config", help="Configuration file management")
+    cfg_sub = cfg.add_subparsers(dest="subcommand", required=True)
+    cfg_sub.add_parser("list", help="List known configuration files")
+    show = cfg_sub.add_parser("show", help="Print a configuration file")
+    show.add_argument("path", nargs="?", help="File to show (default: the active configuration)")
+    edit = cfg_sub.add_parser("edit", help="Open a configuration file in $EDITOR")
+    edit.add_argument("path", nargs="?", help="File to edit (default: the active configuration)")
+    edit.add_argument("--editor", help="Editor command (default $EDITOR/$VISUAL)")
+    edit.add_argument("--no-validate", action="store_true", help="Skip validation after editing")
+    cp = cfg_sub.add_parser("copy", help="Duplicate a configuration file")
+    cp.add_argument("path", nargs="?", help="File to copy (default: the active configuration)")
+    cp.add_argument("destination", help="Where to write the copy")
+    rm = cfg_sub.add_parser("delete", help="Delete a configuration file")
+    rm.add_argument("path", nargs="?", help="File to delete (default: the active configuration)")
+    use = cfg_sub.add_parser("use", help="Remember a configuration as active")
+    use.add_argument("path", help="Configuration file to make active")
+    cfg_sub.add_parser("forget", help="Stop remembering the active configuration")
+
     return parser
 
 
@@ -153,6 +171,7 @@ class CLI:
             "uninstall": self._uninstall,
             "menu": self._menu,
             "wizard": self._wizard,
+            "config": self._config,
         }
         handler = handlers.get(self.args.command)
         if handler is None:
@@ -330,6 +349,39 @@ class CLI:
             sections = EXIT_FLOW if self.args.preset == "exit" else None
         run_wizard(target, sections, prompt=input)
         return {"path": str(target)}
+
+    def _config(self):
+        from ..config.management import ConfigFileManager
+
+        manager = ConfigFileManager(self.args.config)
+        sub = self.args.subcommand
+
+        if sub == "list":
+            return {"files": manager.list()}
+        if sub == "forget":
+            return manager.forget()
+        if sub == "use":
+            return manager.use(self.args.path)
+        if sub == "copy":
+            return manager.copy(self.args.path, self.args.destination)
+        if sub == "delete":
+            return manager.delete(self.args.path, yes=bool(self.args.yes))
+        if sub == "show":
+            return manager.show(self.args.path)
+        if sub == "edit":
+            outcome = manager.edit(self.args.path, editor=self.args.editor)
+            if self.args.no_validate:
+                return outcome.as_dict()
+            if not outcome.valid:
+                # Validation errors are surfaced by the report itself; the
+                # command still fails loudly so automation notices.
+                raise ValidationError(
+                    f"Configuration is invalid after editing {outcome.path}; "
+                    f"the previous version is preserved at {outcome.kept_backup}"
+                )
+            return outcome.as_dict()
+        _log.error("Unknown config subcommand %s", sub)
+        return 2
 
 
 def _find_shipped_script(name: str) -> Path:
