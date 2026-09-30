@@ -105,7 +105,61 @@ routes:
 """
     fragments = generate(text)
     assert "map $ssl_preread_alpn_protocols $pg_alpn_stream {" in fragments["maps.conf"]
-    assert "~h2 pg_h2_route;" in fragments["maps.conf"]
+    # $ssl_preread_alpn_protocols is a comma-separated list ("h2,http/1.1"),
+    # so the key must be anchored to a full element. A substring key such as
+    # ~h2 would also match a protocol merely containing the text "h2".
+    assert "~^(?:[^,]+,)*h2(?:,[^,]+)*$ pg_h2_route;" in fragments["maps.conf"]
+
+
+def test_alpn_route_actually_selects_the_alpn_variable():
+    """An ALPN route must proxy through the ALPN map, not the SNI map.
+
+    Previously the ALPN table was generated but the stream `server` always
+    referenced the SNI variable, so ALPN routing never took effect.
+    """
+    text = BASE + """
+routes:
+  - id: h2-route
+    listener: stream
+    transport: {type: tcp}
+    match: {type: alpn, value: h2}
+    backend: nl
+"""
+    fragments = generate(text)
+    stream = fragments["stream.conf"]
+    assert "proxy_pass $pg_alpn_stream;" in stream
+    assert "$pg_sni_stream" not in stream
+
+
+def test_alpn_matcher_value_is_regex_escaped():
+    """A "." in an ALPN name must not act as a regex wildcard."""
+    text = BASE + """
+routes:
+  - id: spdy-route
+    listener: stream
+    transport: {type: tcp}
+    match: {type: alpn, value: spdy/3.1}
+    backend: nl
+"""
+    fragments = generate(text)
+    assert r"~^(?:[^,]+,)*spdy/3\.1(?:,[^,]+)*$ pg_spdy_route;" in fragments["maps.conf"]
+
+
+def test_stream_listener_with_only_a_default_route_proxies_directly():
+    """No SNI/ALPN routes means no map exists, so the server must proxy to the
+    default upstream directly instead of referencing an undefined variable."""
+    text = BASE + """
+routes:
+  - id: catchall
+    listener: stream
+    transport: {type: tcp}
+    backend: nl
+"""
+    fragments = generate(text)
+    stream = fragments["stream.conf"]
+    assert "proxy_pass pg_catchall;" in stream
+    assert "$pg_sni_stream" not in stream
+    assert "pg_alpn_stream" not in stream
 
 
 def test_two_default_routes_on_one_stream_listener_is_an_error():

@@ -231,12 +231,14 @@ def _run_probe(binary: str, feature: str, config: str, load_lines: str) -> bool:
     with tempfile.TemporaryDirectory(prefix="pg-router-probe-") as tempdir:
         prefix = Path(tempdir)
         (prefix / "logs").mkdir()
-        (prefix / "temp").mkdir()
         main_conf = prefix / "nginx.conf"
+        # Only directives nginx actually has in the main context. There is no
+        # bare "temp_path" directive (nginx uses client_body_temp_path,
+        # proxy_temp_path, ...); "nginx -t" never writes temp files anyway, so
+        # none of them belong here.
         main_conf.write_text(
             f"error_log {prefix / 'logs' / 'error.log'} warn;\n"
             f"pid {prefix / 'nginx.pid'};\n"
-            f"temp_path {prefix / 'temp'};\n"
             f"{load_lines}\n"
             f"{config}\n",
             encoding="utf-8",

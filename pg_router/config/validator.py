@@ -16,6 +16,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from ..model.capabilities import HTTP, STREAM, capability
+from ..model.selection import (
+    MatcherCompileError,
+    RouteSelection,
+    StreamSelection,
+    compile_route_match,
+)
 from ..utils.logging import get_logger
 from ..utils.security import ValidationError
 from .schema import (
@@ -80,12 +87,13 @@ class ValidationReport:
 class Validator:
     """Validates a fully parsed RouterConfig."""
 
-    STREAM_ONLY_MATCHERS = ("sni", "alpn")
-    HTTP_ONLY_MATCHERS = ("path", "path_prefix", "path_regex")
-
     def __init__(self, config: RouterConfig) -> None:
         self.config = config
         self.report = ValidationReport()
+        # Compiled matcher selections, keyed by route id. Computed once in
+        # validate_matcher_compilation() and reused by the uniqueness checks so
+        # that validation and generation provably reason about the same thing.
+        self.selections: dict[str, RouteSelection] = {}
 
     # ------------------------------------------------------------------
     # entry point
@@ -93,9 +101,11 @@ class Validator:
     def validate(self) -> ValidationReport:
         self.validate_references()
         self.validate_listener_compatibility()
+        self.validate_matcher_compilation()
         self.validate_tls()
         self.validate_uniqueness()
         self.validate_chains()
+        self.validate_fallbacks()
         self.detect_loops()
         return self.report
 
@@ -174,23 +184,26 @@ class Validator:
                     f"but listener {listener.id!r} is mode {listener.mode!r}",
                 )
                 continue
-            matchers = route.match.all_matchers() if route.match else []
-            matcher_types = [m.type for m in matchers if m.type]
-            bad_stream = [t for t in matcher_types if t in self.HTTP_ONLY_MATCHERS]
-            bad_http = [t for t in matcher_types if t in self.STREAM_ONLY_MATCHERS]
-            if listener.mode == "stream" and bad_stream:
-                self.report.error(
-                    route.id,
-                    f"matcher(s) {bad_stream} match HTTP paths and cannot be used on a stream listener",
-                )
-            if listener.mode == "http" and bad_http:
-                self.report.error(
-                    route.id,
-                    f"matcher(s) {bad_http} need ssl_preread and require a stream listener",
-                )
-            if listener.mode == "stream" and not bad_http and not bad_stream:
-                # stream route without an SNI/ALPN matcher: allowed (default backend)
-                pass
+            # Layer compatibility of every matcher type comes from the single
+            # capability table, so this can never drift from what the generator
+            # emits.
+            for matcher in (route.match.all_matchers() if route.match else []):
+                if matcher.type is None:
+                    continue
+                record = capability(matcher.type)
+                if record.enforced and not record.enforced_in(listener.mode):
+                    if listener.mode == STREAM:
+                        self.report.error(
+                            route.id,
+                            f"matcher(s) {[matcher.type]} match HTTP paths and "
+                            "cannot be used on a stream listener",
+                        )
+                    else:
+                        self.report.error(
+                            route.id,
+                            f"matcher(s) {[matcher.type]} need ssl_preread and "
+                            "require a stream listener",
+                        )
 
         # listener bind conflicts
         seen: dict[tuple[str, int, str], str] = {}
@@ -204,6 +217,95 @@ class Validator:
                     )
                 else:
                     seen[key] = listener.id
+
+    # ------------------------------------------------------------------
+    # matcher compilation
+    # ------------------------------------------------------------------
+    def validate_matcher_compilation(self) -> None:
+        """Compile every route's matcher the same way the generator will.
+
+        Anything nginx cannot express is rejected here, at validation time,
+        instead of silently producing a config that behaves differently from
+        the one the simulator would describe. Also enforces two listener-level
+        constraints the generator relies on:
+
+        * a stream listener cannot mix SNI and ALPN routes (one ``server`` has
+          one ``proxy_pass`` selector);
+        * SNI/ALPN matchers on a plaintext listener cannot work (ssl_preread
+          reads the TLS handshake).
+        """
+        cfg = self.config
+        stream_kinds: dict[str, set[str]] = {}   # listener id -> {sni, alpn}
+
+        for route in cfg.routes:
+            if not cfg.has("listener", route.listener):
+                continue
+            listener: Listener = cfg.get("listener", route.listener)
+            if route.match is None:
+                continue
+            try:
+                selection = compile_route_match(
+                    route,
+                    listener.mode,
+                    allow_unenforced=route.unenforced_matchers == "allow",
+                )
+            except MatcherCompileError as exc:
+                self.report.error(route.id, str(exc))
+                continue
+            self.selections[route.id] = selection
+
+            if listener.mode == STREAM and selection.stream is not None:
+                kinds = stream_kinds.setdefault(listener.id, set())
+                if selection.stream.values:
+                    kinds.add(selection.stream.kind)
+                    if listener.tls.mode == "disabled":
+                        self.report.error(
+                            route.id,
+                            "stream listener has SNI/ALPN matchers but tls.mode is "
+                            "'disabled'; ssl_preread cannot read SNI from plaintext",
+                        )
+
+        for listener_id, kinds in stream_kinds.items():
+            if len(kinds) > 1:
+                self.report.error(
+                    listener_id,
+                    f"stream listener routes mix {sorted(kinds)} matchers; one stream "
+                    "`server` can proxy to a single selector variable, so split "
+                    "SNI and ALPN routes across listeners",
+                )
+
+    # ------------------------------------------------------------------
+    # fallback semantics
+    # ------------------------------------------------------------------
+    def validate_fallbacks(self) -> None:
+        """A fallback target must be usable as an nginx upstream backup member."""
+        cfg = self.config
+        for route in cfg.routes:
+            if not route.fallback:
+                continue
+            if not cfg.has("route", route.fallback):
+                continue  # reported by validate_references
+            target: Route = cfg.get("route", route.fallback)
+            if not target.enabled:
+                self.report.error(
+                    route.id,
+                    f"fallback route {route.fallback!r} is disabled; enable it or "
+                    "remove the fallback",
+                )
+            if target.transport.layer != route.transport.layer:
+                self.report.error(
+                    route.id,
+                    f"fallback route {route.fallback!r} uses transport layer "
+                    f"{target.transport.layer!r} but this route uses "
+                    f"{route.transport.layer!r}; a fallback shares one upstream "
+                    "block with the route",
+                )
+            if target.match is not None:
+                self.report.warning(
+                    route.id,
+                    f"fallback route {route.fallback!r} has its own matcher, which is "
+                    "ignored while it serves as a backup target",
+                )
 
     # ------------------------------------------------------------------
     # TLS
@@ -240,14 +342,15 @@ class Validator:
     def validate_uniqueness(self) -> None:
         cfg = self.config
         http_keys: dict[str, dict[str, str]] = {}   # listener -> location key -> route
-        sni_values: dict[str, dict[str, str]] = {}  # listener -> sni -> route
+        sni_values: dict[str, dict[str, str]] = {}  # listener -> sni/alpn -> route
 
         for route in cfg.routes:
             if not cfg.has("listener", route.listener):
                 continue
             listener: Listener = cfg.get("listener", route.listener)
-            if listener.mode == "http":
-                keys = self._http_location_keys(route)
+            selection = self.selections.get(route.id)
+            if listener.mode == HTTP:
+                keys = selection.http.location_keys() if selection else ["=/"]
                 table = http_keys.setdefault(listener.id, {})
                 for key in keys:
                     if key in table:
@@ -257,45 +360,18 @@ class Validator:
                         )
                     else:
                         table[key] = route.id
-            else:
-                snis = self._stream_sni_values(route)
+            elif selection is not None and selection.stream is not None:
+                values = selection.stream.values
                 table = sni_values.setdefault(listener.id, {})
-                for sni in snis:
-                    if sni in table:
+                label = selection.stream.kind.upper()
+                for value in values:
+                    if value in table:
                         self.report.error(
                             route.id,
-                            f"duplicate SNI {sni!r} already routed by {table[sni]!r}",
+                            f"duplicate {label} {value!r} already routed by {table[value]!r}",
                         )
                     else:
-                        table[sni] = route.id
-
-    @staticmethod
-    def _http_location_keys(route: Route) -> list[str]:
-        """Return canonical nginx location keys a route would emit."""
-        if route.match is None:
-            return ["=/"]
-        keys: list[str] = []
-        for matcher in route.match.all_matchers():
-            if matcher.type == "path":
-                keys.append(f"={matcher.value}")
-            elif matcher.type == "path_prefix":
-                prefix = matcher.value or "/"
-                keys.append(f"^{prefix}")
-            elif matcher.type == "path_regex":
-                keys.append(f"~{matcher.value}")
-        return keys or ["=/"]
-
-    @staticmethod
-    def _stream_sni_values(route: Route) -> list[str]:
-        if route.match is None:
-            return []
-        values: list[str] = []
-        for matcher in route.match.all_matchers():
-            if matcher.type == "sni" and matcher.value:
-                values.append(matcher.value.lower())
-            if matcher.type == "sni" and matcher.values:
-                values.extend(v.lower() for v in matcher.values)
-        return values
+                        table[value] = route.id
 
     # ------------------------------------------------------------------
     # chains

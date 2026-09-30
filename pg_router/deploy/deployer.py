@@ -34,6 +34,8 @@ from ..utils.logging import get_logger
 from ..utils.security import validate_filesystem_path
 from ..nginx.generator import ConfigGenerator, GenerationResult, FRAGMENT_NAMES
 from ..nginx.manager import NginxManager
+from .diff import diff_fragments
+from .lock import DeployLock, DeployLockBusy
 
 _log = get_logger(__name__)
 
@@ -59,6 +61,8 @@ class DeployResult:
     reloaded: bool = False
     rolled_back: bool = False
     snapshot: str = ""
+    diff: str = ""
+    stage: str = ""
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -72,11 +76,27 @@ class DeployResult:
             "reloaded": self.reloaded,
             "rolled_back": self.rolled_back,
             "snapshot": self.snapshot,
+            "stage": self.stage,
+            "changed_fragments": self.changed_fragment_names,
             "warnings": list(self.warnings),
             "errors": list(self.errors),
             "upstreams": dict(self.generated.upstreams) if self.generated else {},
             "routes": dict(self.generated.route_upstream) if self.generated else {},
         }
+
+    @property
+    def changed_fragment_names(self) -> list[str]:
+        """Fragments whose content differs from the currently live set.
+
+        Derived from the unified diff so the CLI and the JSON state record
+        agree on what an apply would touch.
+        """
+        names: list[str] = []
+        for line in self.diff.splitlines():
+            # difflib emits "--- live: <name>" once per changed fragment.
+            if line.startswith("--- live: "):
+                names.append(line[len("--- live: "):].strip())
+        return names
 
 
 @dataclass
@@ -171,52 +191,85 @@ class Deployer:
         self.manager.ensure_privileges()
         self._ensure_managed_dir()
 
-        if dry_run:
-            staged_ok, staged_output = self._test_in_staging(fragments)
-            self.report.staged_test_ok = staged_ok
-            self.report.staged_test_output = staged_output
-            if staged_ok:
-                _log.info("Dry run: configuration generated and validated successfully")
-            else:
-                self.report.errors.append(staged_output)
-            return self.report
-
-        snapshot_name = self._backup_current()
-        self.report.snapshot = snapshot_name
-
-        staged_ok, staged_output = self._test_in_staging(fragments)
-        self.report.staged_test_ok = staged_ok
-        self.report.staged_test_output = staged_output
-        if not staged_ok:
-            self.report.errors.append(f"Staging test failed: {staged_output}")
-            self._rollback_to(snapshot_name)
-            self.report.rolled_back = True
-            raise DeploymentError("Generated configuration failed nginx -t in staging", self.report)
-
-        self._swap_fragments(fragments)
-
-        live_ok, live_output = self.manager.test()
-        self.report.live_test_ok = live_ok
-        self.report.live_test_output = live_output
-        if not live_ok:
-            self.report.errors.append(f"Live nginx -t failed: {live_output}")
-            self._rollback_to(snapshot_name)
-            self.report.rolled_back = True
-            raise DeploymentError("Live nginx -t failed; previous configuration restored", self.report)
-
+        # Serialize against any other apply/rollback: both rewrite the shared
+        # managed directory and resequence snapshots, so interleaving them
+        # corrupts state. plan() above is read-only and runs outside the lock.
         try:
-            self.manager.reload()
-        except Exception as exc:
-            self.report.errors.append(f"Reload failed: {exc}")
-            self._rollback_to(snapshot_name)
-            self.report.rolled_back = True
-            raise DeploymentError("Nginx reload failed; rolled back", self.report) from exc
+            with DeployLock(self.managed_dir, operation="dry-run" if dry_run else "apply"):
+                if dry_run:
+                    self.report.diff = diff_fragments(self.managed_dir, fragments)
+                    staged_ok, staged_output = self._test_in_staging(fragments)
+                    self.report.staged_test_ok = staged_ok
+                    self.report.staged_test_output = staged_output
+                    if staged_ok:
+                        _log.info("Dry run: configuration generated and validated successfully")
+                        if self.report.changed_fragment_names:
+                            _log.info(
+                                "Would change: %s",
+                                ", ".join(sorted(self.report.changed_fragment_names)),
+                            )
+                        else:
+                            _log.info("No changes to live fragments")
+                    else:
+                        self.report.errors.append(staged_output)
+                    return self.report
 
-        self.report.reloaded = True
-        self.report.applied = True
-        self._record_state(snapshot_name, fragments)
-        _log.info("Deployment complete (snapshot %s)", snapshot_name)
-        return self.report
+                snapshot_name = self._backup_current()
+                self.report.snapshot = snapshot_name
+                self.report.stage = "staging-test"
+
+                staged_ok, staged_output = self._test_in_staging(fragments)
+                self.report.staged_test_ok = staged_ok
+                self.report.staged_test_output = staged_output
+                if not staged_ok:
+                    self.report.errors.append(f"Staging test failed: {staged_output}")
+                    self._rollback_to(snapshot_name)
+                    self.report.rolled_back = True
+                    raise DeploymentError(
+                        "Generated configuration failed nginx -t in staging "
+                        f"(no live fragment was changed; snapshot {snapshot_name} restored)",
+                        self.report,
+                    )
+
+                self.report.stage = "swap"
+                self._swap_fragments(fragments)
+
+                self.report.stage = "live-test"
+                live_ok, live_output = self.manager.test()
+                self.report.live_test_ok = live_ok
+                self.report.live_test_output = live_output
+                if not live_ok:
+                    self.report.errors.append(f"Live nginx -t failed: {live_output}")
+                    self._rollback_to(snapshot_name)
+                    self.report.rolled_back = True
+                    raise DeploymentError(
+                        "Live nginx -t failed; previous configuration restored "
+                        f"from snapshot {snapshot_name} (nginx still serves the old config "
+                        "in memory)",
+                        self.report,
+                    )
+
+                self.report.stage = "reload"
+                try:
+                    self.manager.reload()
+                except Exception as exc:
+                    self.report.errors.append(f"Reload failed: {exc}")
+                    self._rollback_to(snapshot_name)
+                    self.report.rolled_back = True
+                    raise DeploymentError(
+                        f"Nginx reload failed; rolled back to snapshot {snapshot_name} "
+                        "(old configuration still active in memory)",
+                        self.report,
+                    ) from exc
+
+                self.report.reloaded = True
+                self.report.applied = True
+                self._record_state(snapshot_name, fragments)
+                _log.info("Deployment complete (snapshot %s)", snapshot_name)
+                return self.report
+        except DeployLockBusy as exc:
+            self.report.errors.append(str(exc))
+            raise DeploymentError(str(exc), self.report) from exc
 
     # ------------------------------------------------------------------
     # files
@@ -238,9 +291,18 @@ class Deployer:
             tmp.write_text(content, encoding="utf-8")
             os.replace(tmp, target)   # atomic rename within the same filesystem
             _log.info("Wrote %s (%d bytes)", target, len(content))
-        # remove any stale managed fragments not in FRAGMENT_NAMES
+        self._remove_stale_fragments(set(fragments))
+
+    def _remove_stale_fragments(self, keep: set[str]) -> None:
+        """Delete managed fragments that no longer belong to the deployed set.
+
+        Without this, removing the last stream route would leave a stale
+        ``stream.conf`` behind that still references upstreams the new config
+        deleted, and ``nginx -t`` would fail on the next unrelated deploy.
+        """
         for path in Path(self.managed_dir).glob("*.conf"):
-            if path.name not in FRAGMENT_NAMES:
+            if path.name not in keep:
+                _log.info("Removed stale fragment %s", path)
                 path.unlink()
 
     def _test_in_staging(self, fragments: dict[str, str]) -> tuple[bool, str]:
@@ -273,12 +335,13 @@ class Deployer:
         with tempfile.TemporaryDirectory(prefix="pg-router-staging-") as tempdir:
             prefix = Path(tempdir)
             (prefix / "logs").mkdir()
-            (prefix / "temp").mkdir()
             main_conf = prefix / "nginx.conf"
+            # Only main-context directives nginx actually supports: there is no
+            # bare "temp_path" (nginx uses client_body_temp_path / proxy_temp_path
+            # / ...). "nginx -t" parses only, so no temp paths are needed.
             main_conf.write_text(
                 f"error_log {prefix / 'logs' / 'error.log'} warn;\n"
                 f"pid {prefix / 'nginx.pid'};\n"
-                f"temp_path {prefix / 'temp'};\n"
                 "worker_processes auto;\n"
                 "events { worker_connections 128; }\n"
                 "http {\n"
@@ -341,35 +404,60 @@ class Deployer:
             shutil.rmtree(old, ignore_errors=True)
 
     def _rollback_to(self, name: str) -> None:
+        """Restore a snapshot's fragments into the live directory.
+
+        Rollback is the failure path of a failed deploy, so it must not itself
+        be able to fail halfway and leave a mix of old and new fragments. The
+        snapshot is copied into a staging directory *inside* the managed tree
+        first (so ``os.replace`` never crosses a filesystem), then each
+        fragment is swapped with an atomic rename, and any fragment the
+        snapshot does not contain is removed. A crash mid-swap leaves the
+        snapshot directory -- the source of truth -- untouched.
+        """
         snapshot_dir = Path(self.managed_dir) / SNAPSHOT_DIR / name
         if not snapshot_dir.exists():
             _log.error("Snapshot %s missing; cannot roll back", name)
             return
-        for path in snapshot_dir.glob("*.conf"):
-            target = self._managed_fragment_path(path.name)
-            shutil.copy2(path, target)
+
+        staged: dict[str, Path] = {}
+        with tempfile.TemporaryDirectory(dir=self.managed_dir, prefix=".rollback-") as tempdir:
+            staging = Path(tempdir)
+            for path in snapshot_dir.glob("*.conf"):
+                target = staging / path.name
+                shutil.copy2(path, target)
+                staged[path.name] = target
+            for name_, source in staged.items():
+                live = self._managed_fragment_path(name_)
+                os.replace(source, live)
+                _log.info("Restored %s from snapshot %s", live, name)
+        self._remove_stale_fragments(set(staged))
         _log.info("Rolled back managed fragments to snapshot %s", name)
 
     def rollback(self, name: Optional[str] = None) -> DeployResult:
         """Restore a previous snapshot (latest if unnamed) and reload."""
         self.manager.ensure_privileges()
-        target = name or self._latest_snapshot()
-        if not target:
-            self.report.errors.append("No snapshots available to roll back to")
-            raise DeploymentError("Nothing to roll back to", self.report)
-        self._rollback_to(target)
-        ok, output = self.manager.test()
-        self.report.live_test_ok = ok
-        self.report.live_test_output = output
-        if not ok:
-            self.report.errors.append(output)
-            raise DeploymentError(f"Rolled-back configuration failed nginx -t: {output}", self.report)
-        self.manager.reload()
-        self.report.reloaded = True
-        self.report.rolled_back = True
-        self.report.applied = False
-        _log.info("Rollback to snapshot %s complete and reloaded", target)
-        return self.report
+        try:
+            with DeployLock(self.managed_dir, operation="rollback"):
+                target = name or self._latest_snapshot()
+                if not target:
+                    self.report.errors.append("No snapshots available to roll back to")
+                    raise DeploymentError("Nothing to roll back to", self.report)
+                self._rollback_to(target)
+                ok, output = self.manager.test()
+                self.report.live_test_ok = ok
+                self.report.live_test_output = output
+                if not ok:
+                    self.report.errors.append(output)
+                    raise DeploymentError(f"Rolled-back configuration failed nginx -t: {output}", self.report)
+                self.manager.reload()
+                self.report.reloaded = True
+                self.report.rolled_back = True
+                self.report.applied = False
+                _log.info("Rollback to snapshot %s complete and reloaded", target)
+                return self.report
+        except DeployLockBusy as exc:
+            self.report.errors.append(str(exc))
+            raise DeploymentError(str(exc), self.report) from exc
 
     def _latest_snapshot(self) -> Optional[str]:
         snapshots = sorted((Path(self.managed_dir) / SNAPSHOT_DIR).glob("*"))

@@ -81,7 +81,12 @@ def _build_parser() -> argparse.ArgumentParser:
     rb = sub.add_parser("rollback", help="Restore the previous known-good configuration")
     rb.add_argument("snapshot", nargs="?", help="Snapshot name (default: latest)")
 
-    sub.add_parser("status", help="Overall status: nginx, objects, snapshots")
+    status_parser = sub.add_parser("status", help="Overall status: nginx, objects, snapshots")
+    status_parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Also show the last deploy record and the full snapshot history",
+    )
 
     routes = sub.add_parser("routes", help="Route management")
     routes_sub = routes.add_subparsers(dest="subcommand", required=True)
@@ -262,10 +267,20 @@ class CLI:
     def _status(self):
         service = DeployService(self.config_service.load(), self.managed_dir)
         status = service.status()
-        status["snapshots"] = service.history()
         status["validation"] = {
             "valid": self.config_service.validate().valid,
         }
+        # The snapshot list is only useful when an operator is about to roll
+        # back, so it is opt-in (--full) to keep the default output scannable.
+        if self.args.full:
+            status["snapshots"] = service.history()
+            last = status.get("last_deploy")
+            if last is None:
+                status["last_deploy"] = "never deployed"
+        else:
+            status.pop("snapshots", None)
+            # last_deploy is small and answers "when did this last change?",
+            # so it stays in the default view.
         return status
 
     # ------------------------------------------------------------------

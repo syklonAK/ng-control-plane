@@ -836,6 +836,10 @@ class Route:
     health_check: Optional[HealthCheck] = None
     enabled: bool = True
     priority: int = 0
+    # Simulation-only matchers (source_ip, source_cidr, port, ...) are refused
+    # unless the route explicitly acknowledges that nginx will not enforce
+    # them. See pg_router/model/capabilities.py.
+    unenforced_matchers: str = "reject"   # reject | allow
 
     @classmethod
     def from_dict(cls, data: Any) -> "Route":
@@ -873,6 +877,11 @@ class Route:
             else None,
             enabled=validate_bool(_optional(data, "enabled", True), obj_id),
             priority=int(_optional(data, "priority", 0)),
+            unenforced_matchers=validate_choice(
+                str(_optional(data, "unenforced_matchers", "reject")),
+                ("reject", "allow"),
+                obj_id,
+            ),
         )
 
     @property

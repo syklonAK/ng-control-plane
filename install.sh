@@ -492,17 +492,58 @@ ensure_git() {
 }
 
 install_sources() {
+    # A pinned ref (tag like "v1.2.0" or a commit sha) installs exactly that
+    # revision instead of the live branch tip. This matters for repeatability:
+    # a host provisioned today and one provisioned in six months must be able
+    # to run identical code.
+    local ref="${PG_ROUTER_REF:-}"
+
     if [[ -d "${INSTALL_DIR}/.git" ]]; then
         log "updating existing installation"
         git -C "${INSTALL_DIR}" fetch --quiet --force origin "${BRANCH}"
-        git -C "${INSTALL_DIR}" reset --quiet --hard "origin/${BRANCH}"
+        if [[ -n "${ref}" ]]; then
+            if ! git -C "${INSTALL_DIR}" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null; then
+                err "pinned ref '${ref}' could not be resolved; refusing to update blindly"
+                return 1
+            fi
+            git -C "${INSTALL_DIR}" reset --quiet --hard "${ref}"
+        else
+            git -C "${INSTALL_DIR}" reset --quiet --hard "origin/${BRANCH}"
+        fi
         git -C "${INSTALL_DIR}" clean --quiet -fd -e "*.yaml" -e "*.yml" -e "venv"
     else
         log "cloning fresh installation"
         mkdir -p "$(dirname "${INSTALL_DIR}")"
         rm -rf "${INSTALL_DIR}"
-        git clone --quiet --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${INSTALL_DIR}"
+        if [[ -n "${ref}" ]]; then
+            # Clone the history needed to resolve the pinned ref, then check it
+            # out: --depth 1 --branch would only accept a branch or tag name.
+            git clone --quiet "${REPO_URL}" "${INSTALL_DIR}"
+            git -C "${INSTALL_DIR}" fetch --quiet --force origin "${BRANCH}"
+            if ! git -C "${INSTALL_DIR}" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null; then
+                err "pinned ref '${ref}' could not be resolved; refusing to install blindly"
+                return 1
+            fi
+            git -C "${INSTALL_DIR}" reset --quiet --hard "${ref}"
+        else
+            git clone --quiet --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${INSTALL_DIR}"
+        fi
     fi
+
+    # Verify the working tree is exactly what was asked for before any package
+    # is installed from it.
+    local actual expected
+    actual="$(git -C "${INSTALL_DIR}" rev-parse HEAD)"
+    if [[ -n "${ref}" ]]; then
+        expected="$(git -C "${INSTALL_DIR}" rev-parse "${ref}^{commit}")"
+    else
+        expected="$(git -C "${INSTALL_DIR}" rev-parse "origin/${BRANCH}")"
+    fi
+    if [[ "${actual}" != "${expected}" ]]; then
+        err "working tree is at ${actual:0:12}, expected ${expected:0:12}; aborting before install"
+        return 1
+    fi
+    log "sources at ${actual:0:12}"
 }
 
 install_package() {

@@ -165,7 +165,7 @@ class TopologyResolver:
     # ------------------------------------------------------------------
     # routes
     # ------------------------------------------------------------------
-    def resolve_route(self, route: Route) -> ResolvedRoute:
+    def resolve_route(self, route: Route, _seen: Optional[set] = None) -> ResolvedRoute:
         listener = self.config.get("listener", route.listener)
         resolved = ResolvedRoute(route=route, listener=listener)
         if route.chain:
@@ -178,15 +178,58 @@ class TopologyResolver:
                 if hop.kind == "route":
                     resolved.endpoints = self.resolve_route(self.config.get("route", hop.id)).endpoints
                     break
-        elif route.backend:
-            resolved.endpoints = self.resolve_backend(route.backend)
-        elif route.backend_inline is not None:
-            resolved.endpoints = self._expand_backend(route.backend_inline, "primary", set())
+        else:
+            resolved.endpoints = self._route_endpoints(route)
         if not resolved.endpoints:
             raise ValidationError(
                 f"route {route.id!r} resolves to no backend", route.id
             )
         return resolved
+
+    def _route_endpoints(self, route: Route, _seen: Optional[set] = None) -> list[ResolvedEndpoint]:
+        """The endpoints a route proxies to, including its fallback.
+
+        A fallback route is expressed as ``backup`` members of the same nginx
+        upstream: nginx sends traffic there only when every primary member has
+        failed, which is the semantics ``fallback`` always promised but did not
+        previously implement.
+        """
+        seen = (_seen or set()) | {route.id}
+        if route.chain:
+            chain = self.config.get("chain", route.chain)
+            endpoints: list[ResolvedEndpoint] = []
+            for hop in reversed(self.resolve_chain(chain)):
+                if hop.kind == "backend":
+                    endpoints = self.resolve_backend(hop.id)
+                    break
+                if hop.kind == "route":
+                    endpoints = self.resolve_route(self.config.get("route", hop.id)).endpoints
+                    break
+        elif route.backend:
+            endpoints = self.resolve_backend(route.backend)
+        elif route.backend_inline is not None:
+            endpoints = self._expand_backend(route.backend_inline, "primary", set())
+        else:
+            endpoints = []
+
+        if route.fallback:
+            fallback: Route = self.config.get("route", route.fallback)
+            if route.transport.layer != fallback.transport.layer:
+                raise ValidationError(
+                    f"route {route.id!r}: fallback {fallback.id!r} uses transport "
+                    f"layer {fallback.transport.layer!r}, but this route uses "
+                    f"{route.transport.layer!r}; a fallback shares one upstream block",
+                    route.id,
+                )
+            if fallback.id in seen:
+                raise ValidationError(
+                    f"route {route.id!r}: fallback chain loops at {fallback.id!r}",
+                    route.id,
+                )
+            for endpoint in self._route_endpoints(fallback, seen):
+                endpoint.role = "backup"
+                endpoints.append(endpoint)
+        return endpoints
 
     # ------------------------------------------------------------------
     # chains

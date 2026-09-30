@@ -245,7 +245,19 @@ def test_cli_status_reports_objects_and_snapshots(tmp_path: Path):
     payload = json.loads(output)
     assert code == 0
     assert payload["objects"]["routes"] == 3
+    # The snapshot list is opt-in: it is only useful before a rollback, and
+    # printing it by default buries the state an operator actually scans for.
+    assert "snapshots" not in payload
+    # last_deploy and deploy_lock answer "when did this last change?" and
+    # "is an operation in flight?", so they stay in the default view.
+    assert "last_deploy" in payload
+    assert "deploy_lock" in payload
+
+    code, output = run_cli(["status", "--full"])
+    payload = json.loads(output)
+    assert code == 0
     assert "snapshots" in payload
+    assert payload["last_deploy"] == "never deployed"
 
 
 def test_cli_nginx_test_on_missing_binary(tmp_path: Path):

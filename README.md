@@ -75,7 +75,8 @@ functionally with `nginx -t` before trusting it.
 ## Update
 
 ```bash
-sudo pg-router update
+sudo pg-router update                          # track the branch tip
+sudo PG_ROUTER_REF=v1.2.0 pg-router update     # pin to an exact tag/commit
 ```
 
 This pulls the latest revision from git (skipping the work when already
@@ -83,6 +84,13 @@ up to date), reinstalls dependencies, re-links the CLI, and re-validates the
 existing configuration against the new version. It never touches generated
 nginx fragments, snapshots, or the live config — re-deploy explicitly with
 `pg-router apply`.
+
+Set `PG_ROUTER_REF` (a tag like `v1.2.0` or a full commit sha) to install
+exactly that revision instead of the live branch tip. The updater refuses to
+proceed when the ref cannot be resolved, and verifies the working tree is at
+the intended commit before installing — a host never silently moves to
+unreviewed code. The revision it replaced is recorded in
+`/opt/pg-router/.previous-version`.
 
 ## Uninstall
 
@@ -109,13 +117,14 @@ config: /etc/pg-router/config.yaml
 
   1) Build a configuration (guided wizard)
   2) Configuration files — show / edit / copy / delete
-  3) Status — nginx, objects, snapshots
+  3) Status — nginx, objects, last deploy
   4) Validate configuration
   5) Generate fragments (dry run)
- *6) Apply — validate, generate, test, deploy
- *7) Rollback to a previous snapshot
+  6) Apply — validate, generate, test, deploy
+  7) Preview changes before applying (apply --dry-run)
   8) Routes — list / simulate
   9) Backends, tunnels, health
+  r) Rollback to a previous snapshot
   n) Nginx operations
  *u) Update pg-router from git
   0) Quit
@@ -226,12 +235,24 @@ opaque TLS stream, and never the reverse.
 
 * **Atomic deployment** — fragments are staged and syntax-tested before any
   live file changes; live files are swapped with `os.replace` (atomic rename).
+* **One deploy at a time** — `apply` and `rollback` take a process-wide lock
+  on the managed directory, so two concurrent operations (a menu session and a
+  cron job, say) cannot interleave swaps and corrupt the state. The lock is
+  OS-level: it is released automatically if the holder dies, so a crashed
+  deploy never wedges the tool.
 * **Automatic rollback** — if `nginx -t` or the reload fails after the swap, the
   pre-deployment snapshot is restored automatically. Nginx keeps serving the
   previous in-memory configuration until the reload succeeds, so a broken
   configuration never reaches production traffic.
+* **Preview before applying** — `apply --dry-run` prints a unified diff of the
+  live fragments vs. the new ones and names what would change, without writing
+  anything. `pg-router status` shows the last deploy record and whether a
+  deploy is in flight.
 * **Idempotent** — repeated `install`/`apply` with the same config yields the
   same effective state; no duplicated directives or growing files.
+* **Pinned updates** — `PG_ROUTER_REF` makes an update land on an exact tag or
+  commit instead of the live branch tip, and the updater verifies the tree is
+  at that commit before installing.
 * **No shell injection** — every subprocess call uses an argument list with
   `shell=False`; every value that reaches a directive is validated (ports,
   IPs, hostnames, paths, header names/values) and `;`, `{`, `}` are rejected in
@@ -269,8 +290,9 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Tests
 
 ```bash
-python -m pytest            # 198 tests: schema, matchers, validators, loops,
+python -m pytest            # 284 tests: schema, matchers, validators, loops,
                             # http/stream generation, tunnels, deploy/rollback,
+                            # deploy lock, diff preview, ref pinning,
                             # health/failover, installer, CLI, interactive menu,
                             # guided wizard, update/uninstall, end-to-end
                             # (plus installer shell scenarios run under bash)

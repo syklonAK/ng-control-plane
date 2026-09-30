@@ -7,6 +7,7 @@ same operations without duplicating logic (requirement 30).
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -400,7 +401,30 @@ class DeployService:
         return {
             "nginx": self.manager.status().as_dict(),
             "objects": self.config.summary(),
+            "last_deploy": self.last_deploy(),
+            "deploy_lock": self.deploy_lock(),
         }
+
+    def last_deploy(self) -> Optional[dict]:
+        """The most recent successful deployment record, if any.
+
+        ``None`` (not an empty dict) when no deploy has ever happened, so the
+        CLI can print "never deployed" instead of rendering an empty table.
+        """
+        path = Path(self.managed_dir) / "state" / "last-deploy.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            return {"error": "last-deploy.json is present but unreadable"}
+        return payload
+
+    def deploy_lock(self) -> Optional[str]:
+        """The holder of the deploy lock, if any operation is in progress."""
+        from ..deploy.lock import DeployLock
+
+        return DeployLock(self.managed_dir).holder
 
 
 __all__ = [

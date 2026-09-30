@@ -68,6 +68,15 @@ def test_installer_helpers(tmp_path: Path):
     assert "ALL PASSED" in result.stdout
 
 
+def test_installer_ref_pinning(tmp_path: Path):
+    """The installer must clone/update to exactly a pinned ref when given one,
+    and refuse rather than fall back to the branch tip when the ref is bad —
+    a host must never silently move to unreviewed code."""
+    result = _run("installer_refpin.sh", tmp_path, INSTALL_SH.as_posix())
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ALL PASSED" in result.stdout
+
+
 def test_installer_scenarios(tmp_path: Path):
     result = _run(
         "installer_scenarios.sh",

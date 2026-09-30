@@ -207,3 +207,223 @@ def test_invalid_configuration_is_rejected_before_writing(managed_dir):
 
     assert not list(Path(managed_dir).glob("*.conf"))
     assert manager.tests == 0
+
+
+def test_staging_config_contains_only_valid_main_directives(managed_dir, monkeypatch, tmp_path):
+    """Regression: the staging main config used to emit `temp_path`, which is
+    not an nginx directive, so `nginx -t` failed on every apply with
+    `unknown directive "temp_path"` — the deployment blocker the operator hit.
+
+    The staging config is generated under a temporary directory that is removed
+    on exit, so the tempdir factory is redirected somewhere the test can read.
+    """
+    import tempfile
+
+    import pg_router.deploy.deployer as deployer_module
+
+    staging_root = tmp_path / "captured"
+    staging_root.mkdir()
+
+    class _KeepDir:
+        def __init__(self, prefix):
+            self.name = str(staging_root / prefix.strip("-"))
+
+        def __enter__(self):
+            Path(self.name).mkdir(parents=True, exist_ok=True)
+            return self.name
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", _KeepDir)
+    monkeypatch.setattr(deployer_module.tempfile, "TemporaryDirectory", _KeepDir)
+
+    manager = FakeNginxManager()
+    make_deployer(managed_dir, manager).apply(dry_run=True)
+
+    main_conf = staging_root / "pg-router-staging" / "nginx.conf"
+    text = main_conf.read_text()
+    assert "temp_path" not in text, "temp_path is not an nginx directive"
+    for directive in ("error_log", "pid", "worker_processes", "events {", "http {", "stream {"):
+        assert directive in text
+
+
+def test_probe_configs_contain_no_invalid_directive():
+    """The module probes share the staging mistake: an unparseable probe config
+    makes every probe report 'missing', so detection silently believes nginx
+    lacks modules it has."""
+    from pg_router.nginx import modules as module_detector
+
+    probe = module_detector.FEATURE_PROBES["stream"]
+    main_conf = (
+        "error_log /tmp/pg-router-probe/logs/error.log warn;\n"
+        "pid /tmp/pg-router-probe/nginx.pid;\n"
+        f"{probe}\n"
+    )
+    assert "temp_path" not in main_conf
+
+
+# ----------------------------------------------------------------------
+# concurrent-operation protection and atomic rollback
+# ----------------------------------------------------------------------
+
+def test_concurrent_apply_is_refused(managed_dir):
+    """Two apply/rollback operations must not interleave: they rewrite the
+    same fragment directory and resequence the same snapshots, so a race
+    corrupts state. The second caller must get a clear error, not a hang."""
+    from pg_router.deploy.lock import DeployLock, DeployLockBusy
+
+    manager = FakeNginxManager()
+    deployer = make_deployer(managed_dir, manager)
+
+    with DeployLock(managed_dir, operation="apply"):
+        with pytest.raises(DeploymentError) as excinfo:
+            deployer.apply()
+
+    message = str(excinfo.value)
+    assert "in progress" in message
+    assert "apply" in message
+    # Nothing was written and no reload happened.
+    assert not list(Path(managed_dir).glob("*.conf"))
+    assert manager.reloads == 0
+    assert manager.tests == 0
+
+
+def test_concurrent_rollback_is_refused(managed_dir):
+    from pg_router.deploy.lock import DeployLock
+
+    manager = FakeNginxManager()
+    deployer = make_deployer(managed_dir, manager)
+    deployer.apply()
+
+    with DeployLock(managed_dir, operation="apply"):
+        with pytest.raises(DeploymentError) as excinfo:
+            deployer.rollback()
+
+    assert "in progress" in str(excinfo.value)
+
+
+def test_lock_is_released_after_failed_apply(managed_dir):
+    """A crashed or failed deploy must not wedge the tool: the lock is OS-level
+    and released when the holder exits."""
+    from pg_router.deploy.lock import DeployLock
+
+    manager = FakeNginxManager(test_ok=False)
+    deployer = make_deployer(managed_dir, manager)
+
+    with pytest.raises(DeploymentError):
+        deployer.apply()
+
+    # Re-entering must succeed immediately.
+    with DeployLock(managed_dir, operation="apply"):
+        pass
+
+
+def test_lock_is_reentrant_within_one_process(managed_dir):
+    from pg_router.deploy.lock import DeployLock
+
+    lock = DeployLock(managed_dir, operation="apply")
+    with lock:
+        with lock:
+            pass
+        # Still held: a fresh taker must fail.
+        other = DeployLock(managed_dir, operation="rollback")
+        with pytest.raises(Exception):
+            other.acquire()
+
+
+def test_rollback_removes_fragments_the_snapshot_does_not_have(managed_dir):
+    """Regression: rollback used to copy each snapshot fragment over the live
+    tree but never removed fragments added *after* the snapshot was taken. A
+    deploy that added ``stream.conf`` followed by a rollback left the stale
+    fragment behind, referencing upstreams the restored config had deleted."""
+    manager = FakeNginxManager()
+    deployer = make_deployer(managed_dir, manager)
+    deployer.apply()
+    deployer.apply()  # snapshot 000002 now holds the first deployment
+
+    # Simulate a later deploy that introduces an extra fragment file.
+    extra = Path(managed_dir) / "stale.conf"
+    extra.write_text("# should vanish on rollback\n", encoding="utf-8")
+
+    deployer.rollback()
+    assert not extra.exists()
+    for name in ("maps.conf", "upstreams.conf", "http.conf", "stream.conf"):
+        assert (Path(managed_dir) / name).is_file()
+
+
+def test_rollback_is_atomic_on_failure(managed_dir):
+    """The snapshot directory is the source of truth: staging the restore into
+    a temp dir first means a crash mid-restore cannot corrupt the snapshot."""
+    manager = FakeNginxManager()
+    deployer = make_deployer(managed_dir, manager)
+    deployer.apply()
+    deployer.apply()
+
+    snapshot = sorted((Path(managed_dir) / "backups").glob("*"))[-1]
+    before = {path.name: path.read_text() for path in snapshot.glob("*.conf")}
+
+    deployer.rollback()
+
+    after = {path.name: path.read_text() for path in snapshot.glob("*.conf")}
+    assert before == after
+
+
+# ----------------------------------------------------------------------
+# dry-run diff preview
+# ----------------------------------------------------------------------
+
+def test_dry_run_reports_what_would_change(managed_dir):
+    """A dry run on an empty tree should name every fragment it would write."""
+    manager = FakeNginxManager()
+    result = make_deployer(managed_dir, manager).apply(dry_run=True)
+
+    assert result.dry_run
+    assert set(result.changed_fragment_names) >= {"maps.conf", "upstreams.conf", "http.conf"}
+    # Nothing was written.
+    assert not list(Path(managed_dir).glob("*.conf"))
+
+
+def test_dry_run_reports_no_changes_when_idempotent(managed_dir):
+    manager = FakeNginxManager()
+    deployer = make_deployer(managed_dir, manager)
+    deployer.apply()
+
+    result = deployer.apply(dry_run=True)
+    assert result.changed_fragment_names == []
+    assert "no changes" in result.diff
+
+
+def test_dry_run_diff_shows_a_real_change(managed_dir):
+    """Changing a backend port must surface as a diff line in the upstream."""
+    manager = FakeNginxManager()
+    deployer = make_deployer(managed_dir, manager)
+    deployer.apply()
+
+    changed = CONFIG.replace("port: 62050", "port: 62099")
+    result = Deployer(parse_config_string(changed), managed_dir, manager).apply(dry_run=True)
+
+    assert "upstreams.conf" in result.changed_fragment_names
+    assert "62099" in result.diff
+    assert "62050" in result.diff
+    # The live tree is untouched.
+    assert "62050" in (Path(managed_dir) / "upstreams.conf").read_text()
+
+
+def test_dry_run_diff_reports_fragment_removal(managed_dir):
+    """A config that drops every route must delete the fragments, not leave
+    the old ones serving stale routes."""
+    manager = FakeNginxManager()
+    deployer = make_deployer(managed_dir, manager)
+    deployer.apply()
+    assert (Path(managed_dir) / "http.conf").is_file()
+
+    # Drop the routes block entirely, keeping the rest of the document valid.
+    lines = CONFIG.splitlines()
+    routes_index = next(i for i, line in enumerate(lines) if line.strip() == "routes:")
+    empty = "\n".join(lines[:routes_index]) + "\nroutes: []\n"
+    result = Deployer(parse_config_string(empty), managed_dir, manager).apply(dry_run=True)
+    assert "http.conf" in result.changed_fragment_names
+
+
+

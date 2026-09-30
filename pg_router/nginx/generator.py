@@ -14,6 +14,7 @@ deployment idempotent.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -22,6 +23,13 @@ from ..config.schema import (
     Listener,
     RouterConfig,
     TLSConfig,
+)
+from ..model.selection import (
+    HttpSelection,
+    LocationSpec,
+    MatcherCompileError,
+    RouteSelection,
+    compile_route_match,
 )
 from ..model.topology import ResolvedEndpoint, ResolvedRoute, TopologyResolver
 from ..plugins.registry import certificates as certificate_registry
@@ -69,6 +77,10 @@ class ConfigGenerator:
         self.result = GenerationResult()
         self._upstream_cache: dict[tuple[tuple, ...], str] = {}
         self._certificate_cache: dict[str, tuple[str, str]] = {}
+        # Matcher compilations keyed by route id (see _compile_selections).
+        self._selections: dict[str, RouteSelection] = {}
+        # Per stream listener: which preread selector variables are needed.
+        self._stream_kinds: dict[str, set[str]] = {}
 
     # ------------------------------------------------------------------
     def generate(self) -> GenerationResult:
@@ -80,6 +92,7 @@ class ConfigGenerator:
             upstream = self._emit_upstream(route)
             self.result.route_upstream[route.route.id] = upstream
 
+        self._compile_selections(routes)
         self._stream_defaults = self._compute_stream_defaults(stream_routes)
         self.result.fragments["maps.conf"] = self._render_maps(http_routes, stream_routes)
         self.result.fragments["upstreams.conf"] = self._render_upstreams()
@@ -96,6 +109,33 @@ class ConfigGenerator:
             for warning in self.result.warnings:
                 _log.warning(warning)
         return self.result
+
+    def _compile_selections(self, routes: list[ResolvedRoute]) -> None:
+        """Compile each route's matcher with the same code the validator uses.
+
+        The validator runs first and refuses anything inexpressible, so a
+        compilation error here means the caller skipped validation; it is
+        reported as a generation error rather than silently degrading.
+        """
+        self._selections = {}
+        self._stream_kinds = {}
+        for route in routes:
+            allow = route.route.unenforced_matchers == "allow"
+            try:
+                selection = compile_route_match(
+                    route.route, route.listener.mode, allow_unenforced=allow
+                )
+            except MatcherCompileError as exc:
+                self.result.errors.append(f"route {route.route.id!r}: {exc}")
+                continue
+            self._selections[route.route.id] = selection
+            if selection.stream is not None and selection.stream.values:
+                self._stream_kinds.setdefault(route.listener.id, set()).add(
+                    selection.stream.kind
+                )
+
+    def _selection_of(self, route: ResolvedRoute) -> Optional[RouteSelection]:
+        return self._selections.get(route.route.id)
 
     def _compute_stream_defaults(self, stream_routes: list[ResolvedRoute]) -> dict[str, str]:
         """Per stream listener: upstream of the route that has no matcher."""
@@ -188,13 +228,20 @@ class ConfigGenerator:
         sni_tables: dict[str, dict[str, str]] = {}
         alpn_tables: dict[str, dict[str, str]] = {}
         for route in stream_routes:
-            listener_id = route.listener.id
-            sni = self._sni_table(route)
-            if sni:
-                sni_tables.setdefault(listener_id, {}).update(sni)
-            alpn = self._alpn_table(route)
-            if alpn:
-                alpn_tables.setdefault(listener_id, {}).update(alpn)
+            selection = self._selection_of(route)
+            if selection is None or selection.stream is None:
+                continue
+            upstream = self.result.route_upstream.get(route.route.id)
+            if not upstream:
+                continue
+            if selection.stream.kind == "sni":
+                sni_tables.setdefault(route.listener.id, {}).update(
+                    (value, upstream) for value in selection.stream.values
+                )
+            else:
+                alpn_tables.setdefault(route.listener.id, {}).update(
+                    (value, upstream) for value in selection.stream.values
+                )
 
         for listener_id, table in sni_tables.items():
             listener: Listener = next(r.listener for r in stream_routes if r.listener.id == listener_id)
@@ -209,42 +256,23 @@ class ConfigGenerator:
             lines.append(f"map $ssl_preread_alpn_protocols $pg_alpn_{_safe_name(listener_id)} {{")
             lines.append(f"    default {self._stream_default_upstream(listener)};")
             for protocol, upstream in sorted(table.items()):
-                lines.append(f"    ~{protocol} {upstream};")
+                lines.append(f"    {self._alpn_map_key(protocol)} {upstream};")
             lines.append("}")
             lines.append("")
         if len(lines) == 1:
             return _header("maps: none required")
         return "\n".join(lines) + "\n"
 
-    def _sni_table(self, route: ResolvedRoute) -> dict[str, str]:
-        table: dict[str, str] = {}
-        if route.route.match is None:
-            return table
-        for matcher in route.route.match.all_matchers():
-            if matcher.type != "sni":
-                continue
-            upstream = self.result.route_upstream.get(route.route.id)
-            if not upstream:
-                continue
-            values = matcher.values or ([matcher.value] if matcher.value else [])
-            for value in values:
-                table[value.lower()] = upstream
-        return table
+    @staticmethod
+    def _alpn_map_key(protocol: str) -> str:
+        """An nginx map key matching exactly one ALPN protocol name.
 
-    def _alpn_table(self, route: ResolvedRoute) -> dict[str, str]:
-        table: dict[str, str] = {}
-        if route.route.match is None:
-            return table
-        for matcher in route.route.match.all_matchers():
-            if matcher.type != "alpn":
-                continue
-            upstream = self.result.route_upstream.get(route.route.id)
-            if not upstream:
-                continue
-            values = matcher.values or ([matcher.value] if matcher.value else [])
-            for value in values:
-                table[value] = upstream
-        return table
+        ``$ssl_preread_alpn_protocols`` holds a comma-separated list such as
+        ``h2,http/1.1``. A plain substring key (``~h2``) would also match any
+        protocol merely containing the text, so the value is anchored to a full
+        list element and regex-escaped.
+        """
+        return f"~^(?:[^,]+,)*{re.escape(protocol)}(?:,[^,]+)*$"
 
     def _stream_default_upstream(self, listener: Listener) -> str:
         """Upstream used for SNIs that no route claims."""
@@ -277,25 +305,14 @@ class ConfigGenerator:
             groups.setdefault(specs, []).append(route)
         return list(groups.items())
 
-    @staticmethod
-    def _host_specs(route: ResolvedRoute) -> tuple:
+    def _host_specs(self, route: ResolvedRoute) -> tuple:
         """Canonical server_name spec for a route: ((kind, value), ...)."""
-        if route.route.match is None:
+        selection = self._selection_of(route)
+        if selection is None or selection.http is None or selection.http.is_default_server:
             return (("default", "_"),)
-        specs: list[tuple[str, str]] = []
-        has_host = False
-        for matcher in route.route.match.all_matchers():
-            if matcher.type == "host":
-                has_host = True
-                values = matcher.values or ([matcher.value] if matcher.value else [])
-                for value in values:
-                    specs.append(("exact", value.lower()))
-            elif matcher.type == "host_regex":
-                has_host = True
-                specs.append(("regex", matcher.value or ""))
-        if not has_host:
-            return (("default", "_"),)
-        return tuple(sorted(specs))
+        return tuple(
+            sorted((host.kind, host.value) for host in selection.http.hosts)
+        )
 
     def _render_http_server(
         self,
@@ -322,10 +339,22 @@ class ConfigGenerator:
         elif tls.mode == "disabled":
             lines.append("    # tls.mode disabled: plaintext HTTP on this listener")
         lines.append(f"    client_max_body_size {self.config.defaults.client_max_body_size};")
-        for route in sorted(routes, key=lambda item: (-len(item.route.match.all_matchers() or []), item.route.priority)):
+        # Longest/most specific location first so nginx's own ordering matters
+        # less; nginx reorders by modifier itself, but equal modifiers keep
+        # source order, and a regex listed after a plain prefix would lose.
+        for route in sorted(
+            routes,
+            key=lambda item: (-self._location_count(item), item.route.priority),
+        ):
             lines.extend(self._render_http_location(route))
         lines.append("}")
         return lines
+
+    def _location_count(self, route: ResolvedRoute) -> int:
+        selection = self._selection_of(route)
+        if selection is None or selection.http is None:
+            return 0
+        return len(selection.http.locations)
 
     @staticmethod
     def _wants_http2(routes: list[ResolvedRoute]) -> bool:
@@ -354,34 +383,49 @@ class ConfigGenerator:
         read_timeout = transport.read_timeout or defaults.read_timeout
         send_timeout = transport.send_timeout or defaults.send_timeout
         connect_timeout = transport.connect_timeout or defaults.connect_timeout
-        location = self._location_modifier(route)
         upstream = self.result.route_upstream[route.route.id]
-        lines = [f"    {location} {{"]
-        if transport.is_grpc:
-            scheme = "grpcs://" if transport.upstream_tls else "grpc://"
-            lines.append(f"        grpc_pass {scheme}{upstream};")
-            lines.append("        grpc_set_header X-Real-IP $remote_addr;")
-        else:
-            lines.append(f"        proxy_pass http://{upstream};")
-            lines.append("        proxy_http_version 1.1;")
-            for name, value in self._proxy_headers(route).items():
-                lines.append(f"        proxy_set_header {name} {value};")
-            if transport.is_websocket or transport.type == "httpupgrade":
-                lines.append("        proxy_set_header Upgrade $http_upgrade;")
-                lines.append('        proxy_set_header Connection "upgrade";')
-            elif transport.type in ("xhttp", "splithttp"):
-                lines.append('        proxy_set_header Connection "";')
-                lines.append("        chunked_transfer_encoding on;")
-                lines.append("        client_body_timeout 1w;")
-            lines.append(f"        proxy_read_timeout {read_timeout};")
-            lines.append(f"        proxy_send_timeout {send_timeout};")
-            lines.append(f"        proxy_connect_timeout {connect_timeout};")
-            if not buffer_enabled:
-                lines.append("        proxy_buffering off;")
-                lines.append("        proxy_request_buffering off;")
-        lines.append("    }")
-        lines.append("")
+        selection = self._selection_of(route)
+        http = selection.http if selection is not None else None
+        # One nginx location per compiled location spec. A matcher like
+        # `any: [{path: /x}, {path: /y}]` compiles to two specs, so both paths
+        # reach nginx instead of the previous behaviour of keeping only the
+        # last one.
+        locations = list(http.locations) if http is not None and http.locations else [
+            LocationSpec("", "/", "path_prefix")
+        ]
+        lines: list[str] = []
+        for spec in locations:
+            lines.append(f"    {self._location_line(spec)} {{")
+            if transport.is_grpc:
+                scheme = "grpcs://" if transport.upstream_tls else "grpc://"
+                lines.append(f"        grpc_pass {scheme}{upstream};")
+                lines.append("        grpc_set_header X-Real-IP $remote_addr;")
+            else:
+                lines.append(f"        proxy_pass http://{upstream};")
+                lines.append("        proxy_http_version 1.1;")
+                for name, value in self._proxy_headers(route).items():
+                    lines.append(f"        proxy_set_header {name} {value};")
+                if transport.is_websocket or transport.type == "httpupgrade":
+                    lines.append("        proxy_set_header Upgrade $http_upgrade;")
+                    lines.append('        proxy_set_header Connection "upgrade";')
+                elif transport.type in ("xhttp", "splithttp"):
+                    lines.append('        proxy_set_header Connection "";')
+                    lines.append("        chunked_transfer_encoding on;")
+                    lines.append("        client_body_timeout 1w;")
+                lines.append(f"        proxy_read_timeout {read_timeout};")
+                lines.append(f"        proxy_send_timeout {send_timeout};")
+                lines.append(f"        proxy_connect_timeout {connect_timeout};")
+                if not buffer_enabled:
+                    lines.append("        proxy_buffering off;")
+                    lines.append("        proxy_request_buffering off;")
+            lines.append("    }")
+            lines.append("")
         return lines
+
+    @staticmethod
+    def _location_line(spec: LocationSpec) -> str:
+        """Render `location <modifier> <value>` with normalised whitespace."""
+        return " ".join(f"location {spec.modifier} {spec.value}".split())
 
     def _proxy_headers(self, route: ResolvedRoute) -> dict[str, str]:
         headers: dict[str, str] = {
@@ -397,29 +441,6 @@ class ConfigGenerator:
         headers.update(self.config.defaults.proxy_headers)
         headers.update(route.route.transport.headers)
         return headers
-
-    @staticmethod
-    def _location_modifier(route: ResolvedRoute) -> str:
-        """Return the nginx location line for a route's path matcher(s)."""
-        match = route.route.match
-        if match is None:
-            return "location /"
-        chosen: Optional[tuple[str, str]] = None
-        for matcher in match.all_matchers():
-            if matcher.type == "path":
-                chosen = ("=", matcher.value or "/")
-            elif matcher.type == "path_prefix":
-                value = matcher.value or "/"
-                if value == "/":
-                    chosen = ("", "/")
-                else:
-                    chosen = ("", value)
-            elif matcher.type == "path_regex":
-                chosen = ("~", matcher.value or "/")
-        if chosen is None:
-            return "location /"
-        modifier, value = chosen
-        return f"location {modifier} {value}".replace("  ", " ").strip()
 
     # ------------------------------------------------------------------
     # stream
@@ -441,7 +462,7 @@ class ConfigGenerator:
                 lines.append(f"    listen {address}:{port};")
             if listener.tls.mode == "passthrough":
                 lines.append("    ssl_preread on;")
-            lines.append(f"    proxy_pass ${sni_variable};")
+            lines.append(f"    proxy_pass {self._stream_proxy_target(listener, listener_routes, sni_variable, alpn_variable, default_upstream)};")
             lines.append("    proxy_connect_timeout 10s;")
             lines.append("    proxy_timeout 1w;")
             lines.append("}")
@@ -462,6 +483,49 @@ class ConfigGenerator:
                 "a matcher; only one default route per stream listener is allowed"
             )
         return self.result.route_upstream.get(defaults[0].route.id)
+
+    def _stream_proxy_target(
+        self,
+        listener: Listener,
+        routes: list[ResolvedRoute],
+        sni_variable: str,
+        alpn_variable: str,
+        default_upstream: Optional[str],
+    ) -> str:
+        """What this stream `server` proxies to.
+
+        One nginx `server` has exactly one `proxy_pass`, so the selector is
+        chosen by what the listener's routes actually use:
+
+        * SNI routes present -> the shared SNI map variable;
+        * otherwise ALPN routes present -> the ALPN map variable (previously
+          this was generated but never referenced, so ALPN routing did
+          nothing);
+        * otherwise a matcher-less default route -> its upstream directly,
+          because no map exists to route through.
+
+        Mixing SNI and ALPN routes on one listener is refused by the validator;
+        reaching this point with both means validation was skipped, so it is
+        reported as a generation error.
+        """
+        kinds = self._stream_kinds.get(listener.id, set())
+        if "sni" in kinds and "alpn" in kinds:
+            self.result.errors.append(
+                f"stream listener {listener.id!r} mixes SNI and ALPN routes; run "
+                "'pg-router validate' or split them across listeners"
+            )
+            return f"${sni_variable}"
+        if "sni" in kinds:
+            return f"${sni_variable}"
+        if "alpn" in kinds:
+            return f"${alpn_variable}"
+        if default_upstream:
+            return default_upstream
+        self.result.errors.append(
+            f"stream listener {listener.id!r}: its routes define no SNI/ALPN "
+            "selector and there is no default (matcher-less) route to proxy to"
+        )
+        return BLACKHOLE_UPSTREAM
 
     def _validate_stream_listener(self, listener: Listener, routes: list[ResolvedRoute]) -> None:
         if listener.tls.mode == "disabled":
