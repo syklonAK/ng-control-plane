@@ -43,6 +43,22 @@ itself, adapting to the distro and release it detects:
 
 Requirements are only `root` and `git`.
 
+The same command provisions nginx when it is missing. It detects what is
+already loaded (`nginx -t` probes, never a config edit), then installs only the
+gaps — nginx itself plus the modules this project needs:
+
+```text
+nginx not found        -> nginx + stream/ssl/http modules for the distro
+nginx present, modules missing -> just the missing module packages
+nginx fully provisioned -> nothing is changed (idempotent, safe to re-run)
+```
+
+It never overwrites an existing nginx configuration, only creates its own
+fragment directory. If nginx cannot be installed automatically (a locked-down
+host, a build outside `PATH`, or nginx living on another machine) the installer
+says so and still finishes — retry with `sudo pg-router install` later, or pass
+`PG_ROUTER_SKIP_NGINX=1` from the start when nginx is managed elsewhere.
+
 Or from a checkout:
 
 ```bash

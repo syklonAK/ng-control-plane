@@ -26,6 +26,9 @@ ALL_SCENARIOS = (
     "rocky",
     "alpine",
     "unsupported",
+    "nginx",
+    "nginx-skip",
+    "nginx-fails",
 )
 
 

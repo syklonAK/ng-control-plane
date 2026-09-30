@@ -7,6 +7,11 @@
 # Idempotent: safe to re-run. Installs into /opt/pg-router by default
 # (override with PG_ROUTER_HOME). Never touches existing nginx config.
 #
+# nginx itself and the dynamic modules this project needs (stream, ssl, ...) are
+# installed when missing, via 'pg-router install' which knows the package names
+# per distro and probes what is already loaded. Set PG_ROUTER_SKIP_NGINX=1 to
+# leave nginx entirely to the operator.
+#
 # The system python3 version does not matter. A 3.10+ interpreter is, in order:
 #   1. picked from interpreters already installed,
 #   2. installed from the distro's own packages,
@@ -22,7 +27,7 @@ REPO_URL="${PG_ROUTER_REPO:-https://github.com/syklonAK/ng-control-plane.git}"
 BRANCH="${PG_ROUTER_BRANCH:-main}"
 INSTALL_DIR="${PG_ROUTER_HOME:-/opt/pg-router}"
 VENV_DIR="${INSTALL_DIR}/venv"
-BIN_LINK="/usr/local/bin/pg-router"
+BIN_LINK="${PG_ROUTER_BIN_LINK:-/usr/local/bin/pg-router}"
 
 PY_MIN_VERSION="3.10"
 # Built from source only when no package can provide a modern interpreter.
@@ -520,6 +525,39 @@ install_package() {
     log "$("${BIN_LINK}" --version 2>&1) installed successfully"
 }
 
+ensure_nginx() {
+    # Delegated to the CLI: it detects what is already loaded with 'nginx -t',
+    # knows the module package names per distro family, and installs only what
+    # is missing — so a fully provisioned host is a no-op and a partial one gets
+    # just the gap filled. Safe to re-run any number of times.
+    if [[ "${PG_ROUTER_SKIP_NGINX:-0}" == "1" ]]; then
+        log "PG_ROUTER_SKIP_NGINX=1; leaving nginx to the operator"
+        return 0
+    fi
+
+    log "checking nginx and required modules"
+    if "${BIN_LINK}" install; then
+        log "nginx and required modules are ready"
+        return 0
+    fi
+
+    # Archived releases keep their packages on retired mirrors; the CLI's own
+    # apt update then fails. Re-point the sources and give it one more chance
+    # before giving up.
+    if command -v apt-get >/dev/null 2>&1 && apt_update_retried; then
+        if "${BIN_LINK}" install; then
+            log "nginx and required modules are ready"
+            return 0
+        fi
+    fi
+
+    # Not fatal: the CLI is installed and usable, and nginx may be supplied by
+    # another host, a build outside PATH, or a later provisioning step.
+    err "nginx or its modules could not be installed automatically"
+    err "re-run 'sudo ${BIN_LINK} install' once nginx is available,"
+    err "or set PG_ROUTER_SKIP_NGINX=1 if nginx is managed elsewhere"
+}
+
 main() {
     if [[ "$(id -u)" -ne 0 ]]; then
         err "installer must run as root (prefix with sudo)"
@@ -537,6 +575,7 @@ main() {
     ensure_venv_module || exit 1
     install_sources || exit 1
     install_package || exit 1
+    ensure_nginx
 
     echo
     echo "Next steps:"

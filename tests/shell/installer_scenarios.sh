@@ -115,9 +115,33 @@ run_install() {
             set +euo pipefail
             install_sources() { :; }
             install_package() { :; }
+            ensure_nginx() { :; }
             $EXTRA_OVERRIDES
             main
             echo \"PY=\$PY\"
+        " 2>&1
+}
+
+# nginx provisioning is exercised on its own: the interpreter, the source
+# clone and the CLI are stubbed so only ensure_nginx's decisions run.
+# usage: run_install_nginx <bin-link stub> [PG_ROUTER_SKIP_NGINX]
+run_install_nginx() {
+    env PATH="$STUBS:/usr/bin:/bin" \
+        PG_ROUTER_OS_RELEASE="$ETC/os-release" \
+        PG_ROUTER_APT_SOURCES="$ETC/sources.list" \
+        PG_ROUTER_DEADSNAKES_LIST="$ETC/deadsnakes.list" \
+        PG_ROUTER_KEYRING_DIR="$ETC/keyrings" \
+        PG_ROUTER_APT_CONF="$ETC/apt.conf" \
+        PG_ROUTER_BIN_LINK="$1" \
+        PG_ROUTER_SKIP_NGINX="${2:-0}" \
+        bash -c "
+            source '$install_sh'
+            set +euo pipefail
+            ensure_python() { PY=python3; }
+            ensure_venv_module() { :; }
+            install_sources() { :; }
+            install_package() { :; }
+            main
         " 2>&1
 }
 
@@ -266,6 +290,90 @@ scenario_unsupported() {
 }
 
 # ------------------------------------------------------------------ runner
+
+# A fake pg-router CLI that records its argv, so the installer's delegation is
+# observable without a real nginx.
+write_cli_stub() {
+    local rc="${1:-0}"
+    cat > "$STUBS/pg-router" <<EOF
+#!/usr/bin/env bash
+echo "argv: \$*" >> "$WORK/cli.log"
+exit $rc
+EOF
+    chmod +x "$STUBS/pg-router"
+}
+
+# nginx is missing: the installer must hand the work to 'pg-router install'.
+scenario_nginx_delegated() {
+    setup_common
+    write_os_release ubuntu 22.04 jammy
+    write_cli_stub 0
+
+    local out
+    out="$(run_install_nginx "$STUBS/pg-router")"
+    if [[ -f "$WORK/cli.log" ]] && grep -qx "argv: install" "$WORK/cli.log"; then
+        pass "installer delegates to 'pg-router install'"
+    else
+        fail "nginx delegation" "$(cat "$WORK/cli.log" 2>/dev/null)"
+    fi
+    if [[ "$out" == *"nginx and required modules are ready"* ]]; then
+        pass "successful provisioning is reported"
+    else
+        fail "nginx delegation" "$out"
+    fi
+}
+
+# PG_ROUTER_SKIP_NGINX=1: the CLI must never be invoked.
+scenario_nginx_skipped() {
+    setup_common
+    write_os_release ubuntu 22.04 jammy
+    write_cli_stub 0
+
+    local out
+    out="$(run_install_nginx "$STUBS/pg-router" 1)"
+    if [[ ! -f "$WORK/cli.log" ]]; then
+        pass "nginx provisioning is skipped entirely"
+    else
+        fail "nginx skip" "CLI was invoked: $(cat "$WORK/cli.log")"
+    fi
+    if [[ "$out" == *"PG_ROUTER_SKIP_NGINX=1"* ]]; then
+        pass "skip is reported to the operator"
+    else
+        fail "nginx skip" "$out"
+    fi
+}
+
+# The CLI cannot install nginx (locked-down host, unsupported distro, ...): the
+# installer warns with an actionable hint but still finishes successfully.
+scenario_nginx_failure_is_not_fatal() {
+    setup_common
+    write_os_release ubuntu 22.04 jammy
+    write_cli_stub 3
+    # Keeps the EOL-retry path hermetic: apt refresh succeeds, the retry still
+    # fails because the CLI stub always exits 3.
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$STUBS/apt-get"
+    chmod +x "$STUBS/apt-get"
+
+    local out code
+    out="$(run_install_nginx "$STUBS/pg-router")"
+    code=$?
+    if [[ "$out" == *"could not be installed automatically"* ]]; then
+        pass "an unprovisionable nginx is reported clearly"
+    else
+        fail "nginx failure" "$out"
+    fi
+    if [[ "$code" -eq 0 ]]; then
+        pass "install still completes without nginx"
+    else
+        fail "nginx failure" "main exited $code"
+    fi
+    if [[ "$(grep -c 'argv: install' "$WORK/cli.log" 2>/dev/null)" -ge 2 ]]; then
+        pass "the apt retry re-invokes the installer"
+    else
+        fail "nginx retry" "expected >=2 CLI invocations, got $(grep -c 'argv: install' "$WORK/cli.log" 2>/dev/null)"
+    fi
+}
+
 for scenario in "$@"; do
     case "$scenario" in
         bionic-ppa)   scenario_bionic_ppa ;;
@@ -275,6 +383,9 @@ for scenario in "$@"; do
         rocky)        scenario_rocky_dnf ;;
         alpine)       scenario_alpine ;;
         unsupported)  scenario_unsupported ;;
+        nginx)        scenario_nginx_delegated ;;
+        nginx-skip)   scenario_nginx_skipped ;;
+        nginx-fails)  scenario_nginx_failure_is_not_fatal ;;
         *) echo "unknown scenario: $scenario"; failures=$((failures + 1)) ;;
     esac
 done
