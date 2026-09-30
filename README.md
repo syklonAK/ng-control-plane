@@ -30,9 +30,18 @@ curl -fsSL https://raw.githubusercontent.com/syklonAK/ng-control-plane/main/inst
 ```
 
 The installer never depends on the system `python3` version: it picks any
-interpreter ≥ 3.10 already present and, when none exists, installs one itself
-(versioned distro package, or the deadsnakes PPA on older Ubuntu releases whose
-default is 3.8). Requirements are only `root` and `git`.
+interpreter ≥ 3.10 already present and, when none exists, provisions one
+itself, adapting to the distro and release it detects:
+
+| System | How a modern python is obtained |
+|---|---|
+| Ubuntu 18.04+ (incl. EOL releases) | deadsnakes PPA — apt sources still pointing at the retired mirrors are re-pointed to `old-releases.ubuntu.com` first |
+| Debian 10+ | distro package, then a source build on releases whose archives stop below 3.10 (Debian 10/11) |
+| RHEL / Rocky / Alma / Fedora | `dnf`/`yum` package, then a source build (with a private OpenSSL 1.1.1 on releases that ship 1.0.2) |
+| Alpine | `apk` |
+| anything else | every provisioner in turn, source build included |
+
+Requirements are only `root` and `git`.
 
 Or from a checkout:
 
