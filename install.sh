@@ -635,7 +635,12 @@ main() {
     echo "  pg-router uninstall [--yes] [--purge]"
 }
 
-# Sourced by the test suite to exercise the helpers above.
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# Sourced by the test suite to exercise the helpers above. Only run main when
+# the script is executed directly. The naive "${BASH_SOURCE[0]}" == "$0" test
+# cannot be used here: this installer is documented as
+# `curl -fsSL .../install.sh | sudo bash`, and when bash reads the script from
+# stdin BASH_SOURCE is an empty array, so `set -u` aborts the whole install
+# with "BASH_SOURCE[0]: unbound variable" before main is ever reached.
+if ! (return 0 2>/dev/null); then
     main "$@"
 fi

@@ -77,6 +77,16 @@ def test_installer_ref_pinning(tmp_path: Path):
     assert "ALL PASSED" in result.stdout
 
 
+def test_installer_piped_from_stdin(tmp_path: Path):
+    """The documented one-line form `curl -fsSL .../install.sh | sudo bash` reads
+    the script from stdin, where BASH_SOURCE is empty. The guard that keeps main
+    from running while sourced used to trip `set -u` there and abort the install
+    with "BASH_SOURCE[0]: unbound variable" before anything happened."""
+    result = _run("installer_piped.sh", tmp_path, INSTALL_SH.as_posix())
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ALL PASSED" in result.stdout
+
+
 def test_installer_scenarios(tmp_path: Path):
     result = _run(
         "installer_scenarios.sh",
