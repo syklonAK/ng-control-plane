@@ -219,11 +219,25 @@ class NginxManager:
             f"    include {managed_dir}/{name};"
             for name in ("upstreams.conf", "stream.conf")
         )
-        top_load_lines = "\n".join(
-            f"load_module {path};"
-            for path in self.modules.load_modules
-            if not self._load_module_present(text, path)
-        )
+        # Load the dynamic modules the same way the distro intends: a single
+        # include of its modules-enabled glob keeps the live module set and
+        # load order. Modules that the include (or an existing load_module in
+        # this file) does not already cover are added explicitly, because the
+        # generated fragments also use directives from modules the feature
+        # probes never test (stream proxy/map). nginx refuses to load a module
+        # twice, so covered paths are skipped.
+        modules = self.modules
+        covered = self._load_module_paths_in_text(text)
+        if modules.module_include:
+            covered |= module_detector._include_loads(modules.module_include)
+        extra = [path for path in modules.load_modules if path not in covered]
+        if modules.module_include and modules.module_include not in text:
+            top_load_lines = "\n".join(
+                [f"include {modules.module_include};"]
+                + [f"load_module {path};" for path in extra]
+            )
+        else:
+            top_load_lines = "\n".join(f"load_module {path};" for path in extra)
 
         for block, include_line in (("http", http_include), ("stream", stream_include)):
             if include_line in modified:
@@ -264,8 +278,14 @@ class NginxManager:
         return True
 
     @staticmethod
-    def _load_module_present(text: str, module_path: str) -> bool:
-        return module_path in text
+    def _load_module_paths_in_text(text: str) -> set[str]:
+        """Every .so an existing ``load_module`` line in this file loads."""
+        loaded: set[str] = set()
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "load_module":
+                loaded.add(parts[1].rstrip(";"))
+        return loaded
 
     @staticmethod
     def _insert_into_block(text: str, block: str, line: str) -> str:

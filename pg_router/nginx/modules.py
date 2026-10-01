@@ -11,6 +11,7 @@ Detection combines three signals:
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 import tempfile
@@ -82,7 +83,10 @@ STATIC_FLAGS: dict[str, str] = {
     "http_ssl": "--with-http_ssl_module",
     "http_v2": "--with-http_v2_module",
     "http_grpc": "--with-http_grpc_module",
-    "stream": "--with-stream_module",
+    # nginx spells the stream *core* flag "--with-stream", never
+    # "--with-stream_module" (that form does not exist), with or without
+    # "=dynamic". The sub-modules do use the "_module" suffix.
+    "stream": "--with-stream",
     "stream_ssl": "--with-stream_ssl_module",
     "stream_ssl_preread": "--with-stream_ssl_preread_module",
 }
@@ -92,6 +96,18 @@ DYNAMIC_MODULE_DIRS = (
     "/usr/share/nginx/modules",
     "/usr/libexec/nginx/modules",
     "/etc/nginx/modules",
+)
+
+# Distro-curated load_module lists. Debian/Ubuntu ship one .conf per module
+# under modules-enabled (symlinks into the module directory), each holding a
+# single load_module directive, ordered so a module loads before anything that
+# depends on it. The live nginx.conf includes this glob, so reusing it makes a
+# staging/probe config exercise exactly the module set production uses instead
+# of us guessing .so filenames and dependency order.
+DYNAMIC_MODULE_INCLUDES = (
+    "/etc/nginx/modules-enabled/*.conf",
+    "/usr/share/nginx/modules/*.conf",
+    "/etc/nginx/modules/*.conf",
 )
 
 DYNAMIC_MODULE_FILES: dict[str, tuple[str, ...]] = {
@@ -116,6 +132,9 @@ class NginxModules:
     configure_args: list[str] = field(default_factory=list)
     features: dict[str, bool] = field(default_factory=dict)
     load_modules: list[str] = field(default_factory=list)
+    # Glob of distro .conf files that load the dynamic modules (see
+    # DYNAMIC_MODULE_INCLUDES). Preferred over ``load_modules`` when present.
+    module_include: Optional[str] = None
 
     def supports(self, feature: str) -> bool:
         return bool(self.features.get(feature))
@@ -136,7 +155,34 @@ class NginxModules:
             "version": self.version,
             "features": dict(self.features),
             "load_modules": list(self.load_modules),
+            "module_include": self.module_include,
         }
+
+    def load_lines(self) -> str:
+        """Directives that make a *standalone* config (a module probe or the
+        deployer's staging test) load the same modules the live nginx.conf
+        loads.
+
+        A config built without them parses against a different module set than
+        production: on a dynamic-module build (Debian/Ubuntu) the stream
+        fragments need load_module directives that the live config supplies,
+        so nginx fails with ``unknown "ssl_preread_server_name" variable``
+        before a fragment is ever swapped in.
+
+        The distro's curated include is used when available, and any module it
+        does not load is added explicitly — the generated fragments also use
+        directives from modules the feature probes never cover (the stream
+        proxy and map modules).
+        """
+        lines: list[str] = []
+        covered: set[str] = set()
+        if self.module_include:
+            lines.append(f"include {self.module_include};")
+            covered = _include_loads(self.module_include)
+        for path in self.load_modules:
+            if path not in covered:
+                lines.append(f"load_module {path};")
+        return "\n".join(lines)
 
 
 def find_nginx(binary: Optional[str] = None) -> Optional[str]:
@@ -172,6 +218,66 @@ def _find_dynamic_module(feature: str) -> Optional[str]:
     return None
 
 
+def _find_module_include() -> Optional[str]:
+    """The distro's module load list, if it ships one."""
+    for pattern in DYNAMIC_MODULE_INCLUDES:
+        if glob.glob(pattern):
+            return pattern
+    return None
+
+
+def _include_loads(module_include: Optional[str]) -> set[str]:
+    """Module .so paths a distro include glob loads.
+
+    Needed so an explicit ``load_module`` is only added for modules the
+    curated list does not already cover: nginx refuses to load a module
+    twice and fails the whole config.
+    """
+    if not module_include:
+        return set()
+    loaded: set[str] = set()
+    for conf in glob.glob(module_include):
+        try:
+            content = Path(conf).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "load_module":
+                loaded.add(parts[1].rstrip(";"))
+    return loaded
+
+
+# Core modules other dynamic modules link against; loaded first so dlopen can
+# resolve their symbols. Everything else loads in name order, which happens to
+# put e.g. ngx_stream_ssl_module.so before ngx_stream_ssl_preread_module.so.
+_CORE_MODULE_FILES = (
+    "ngx_stream_module.so",
+    "ngx_mail_module.so",
+)
+
+
+def _find_all_dynamic_modules() -> list[str]:
+    """Every installed module .so, core modules first.
+
+    Used only when the host ships no curated load list. The generated fragments
+    use directives from modules the feature probes do not cover (the stream
+    proxy and map modules), so the whole installed set has to be loaded — which
+    is exactly what a hand-written nginx.conf on such a host does.
+    """
+    for directory in DYNAMIC_MODULE_DIRS:
+        directory_path = Path(directory)
+        if not directory_path.is_dir():
+            continue
+        found = sorted(
+            directory_path.glob("*.so"),
+            key=lambda path: (0 if path.name in _CORE_MODULE_FILES else 1, str(path)),
+        )
+        if found:
+            return [str(path) for path in found]
+    return []
+
+
 def detect(binary: Optional[str] = None) -> NginxModules:
     """Full detection: static flags, dynamic module files, functional probes."""
     found = find_nginx(binary)
@@ -188,18 +294,38 @@ def detect(binary: Optional[str] = None) -> NginxModules:
     args_text = " ".join(modules.configure_args)
     for feature in FEATURE_PROBES:
         static_flag = STATIC_FLAGS.get(feature, "")
-        if static_flag and re.search(re.escape(static_flag) + r"(?!_)", args_text):
-            modules.features[feature] = True
+        if not static_flag:
+            modules.features.setdefault(feature, False)
             continue
-        if static_flag and f"{static_flag}=dynamic" in args_text:
+        # A dynamic build spells the flag "--with-<name>=dynamic": the module
+        # .so then needs an explicit load_module directive, so only record the
+        # file and let the functional probe decide availability. This must run
+        # before the static test: "--with-stream_ssl_preread_module=dynamic"
+        # also matches a plain search for "--with-stream_ssl_preread_module",
+        # which marked dynamic modules as statically built, never emitted their
+        # load_module directive, and then shipped configs nginx could not parse
+        # ("unknown \"ssl_preread_server_name\" variable").
+        if f"{static_flag}=dynamic" in args_text:
             module_path = _find_dynamic_module(feature)
             if module_path:
                 modules.load_modules.append(module_path)
             continue
+        if re.search(re.escape(static_flag) + r"(?![\w=])", args_text):
+            modules.features[feature] = True
+            continue
         modules.features.setdefault(feature, False)
 
+    modules.module_include = _find_module_include()
+    if not modules.module_include and modules.load_modules:
+        # No curated list available: load the whole installed set instead of
+        # only the probed features, so directives from modules the probes never
+        # test (stream proxy/map) resolve in the staging config too.
+        all_modules = _find_all_dynamic_modules()
+        if all_modules:
+            modules.load_modules = all_modules
+
     # http is always present in a standard build; the probe confirms it.
-    probe_result = probe_features(found, modules.load_modules)
+    probe_result = probe_features(found, modules)
     for feature, available in probe_result.items():
         if available:
             modules.features[feature] = True
@@ -211,14 +337,14 @@ def detect(binary: Optional[str] = None) -> NginxModules:
     return modules
 
 
-def probe_features(binary: str, load_modules: Optional[list[str]] = None) -> dict[str, bool]:
+def probe_features(binary: str, modules: Optional[NginxModules] = None) -> dict[str, bool]:
     """Functional probe: can this nginx actually parse each directive?
 
     Each probe config is written to a temporary prefix and tested with
     ``nginx -t``. Nothing is bound permanently and no live config is touched.
     """
     results: dict[str, bool] = {}
-    load_lines = "\n".join(f"load_module {path};" for path in (load_modules or []))
+    load_lines = modules.load_lines() if modules else ""
     for feature, template in FEATURE_PROBES.items():
         config = template.replace("PROBEPORT", str(PROBE_PORT)).replace(
             "PROBEPORT2", str(PROBE_PORT_2)
@@ -251,12 +377,16 @@ def _run_probe(binary: str, feature: str, config: str, load_lines: str) -> bool:
         return True
 
 
-def probe_single(binary: str, feature: str, load_modules: Optional[list[str]] = None) -> bool:
+def probe_single(
+    binary: str,
+    feature: str,
+    modules: Optional[NginxModules] = None,
+) -> bool:
     """Probe exactly one feature (used by the CLI's nginx module commands)."""
     if feature not in FEATURE_PROBES:
         raise CommandError(f"Unknown feature {feature!r}; known: {sorted(FEATURE_PROBES)}")
     config = FEATURE_PROBES[feature].replace("PROBEPORT", str(PROBE_PORT)).replace(
         "PROBEPORT2", str(PROBE_PORT_2)
     )
-    load_lines = "\n".join(f"load_module {path};" for path in (load_modules or []))
+    load_lines = modules.load_lines() if modules else ""
     return _run_probe(binary, feature, config, load_lines)

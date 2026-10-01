@@ -335,6 +335,14 @@ class Deployer:
             for name in ("upstreams.conf", "stream.conf")
             if name in fragments
         )
+        # The staging config must load the same dynamic modules the live
+        # nginx.conf loads, otherwise it tests a different module set than
+        # production: on a dynamic-module build (Debian/Ubuntu) the stream
+        # fragments need load_module directives for ssl_preread and proxy_pass
+        # that the live config pulls in via its modules-enabled include, and
+        # without them nginx fails with "unknown ssl_preread_server_name
+        # variable" before the fragments are ever swapped in.
+        module_lines = self.manager.modules.load_lines()
 
         with tempfile.TemporaryDirectory(prefix="pg-router-staging-") as tempdir:
             prefix = Path(tempdir)
@@ -346,6 +354,7 @@ class Deployer:
             main_conf.write_text(
                 f"error_log {prefix / 'logs' / 'error.log'} warn;\n"
                 f"pid {prefix / 'nginx.pid'};\n"
+                f"{module_lines}\n"
                 "worker_processes auto;\n"
                 "events { worker_connections 128; }\n"
                 "http {\n"

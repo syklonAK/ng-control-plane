@@ -136,6 +136,37 @@ Correspondingly, `ensure_managed_include` wires both `upstreams.conf` and
 stream-only host's `stream.conf` proxies to upstreams defined in
 `upstreams.conf`, and without that include nginx resolves none of them.
 
+## Module detection
+
+`pg_router/nginx/modules.py` never assumes a module exists because nginx is
+installed. It reads `nginx -V`, then resolves each required feature against the
+configure arguments:
+
+* `--with-<name>` — compiled in statically, always available.
+* `--with-<name>=dynamic` — a `.so` that needs an explicit `load_module`
+  directive. This case is checked *before* the static one, because the dynamic
+  flag also contains the static flag as a prefix: matching statically first made
+  every dynamic module read as built-in, so no `load_module` was ever emitted
+  and the staging test then failed with
+  `unknown "ssl_preread_server_name" variable`.
+
+Note that nginx spells the stream *core* flag `--with-stream`, not
+`--with-stream_module`; the sub-modules (`--with-stream_ssl_module`, ...) do take
+the `_module` suffix.
+
+Finally a functional probe runs `nginx -t` on a throwaway config per feature;
+only a passing probe marks a feature available.
+
+Both the probes and the staging test load dynamic modules exactly the way the
+live nginx.conf does: a single `include` of the distro's curated
+`modules-enabled/*.conf` list when the host ships one (Debian/Ubuntu), which
+keeps the live module set *and* load order. Hosts without such a list fall back
+to `load_module` directives for every installed `.so`, core modules first, since
+the generated fragments also use directives from modules the probes do not cover
+(the stream proxy and map modules). A staging config that omits this parses
+against a different module set than production and rejects fragments the live
+config would have loaded.
+
 ## Health and failover
 
 `HealthManager` probes backends, tunnel endpoints and inbounds (TCP connect or

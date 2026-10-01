@@ -327,6 +327,66 @@ routes:
     )
 
 
+def test_staging_config_loads_the_same_dynamic_modules_as_live(
+    managed_dir, monkeypatch, tmp_path
+):
+    """Regression: the staging main config carried no load_module directives at
+    all, so on a dynamic-module build (Debian/Ubuntu) it parsed against a
+    different module set than the live nginx.conf. nginx -t then failed with
+    'unknown "ssl_preread_server_name" variable' even though the live config
+    would have loaded that module via its modules-enabled include."""
+    import tempfile
+
+    import pg_router.deploy.deployer as deployer_module
+
+    staging_root = tmp_path / "captured"
+    staging_root.mkdir()
+
+    class _KeepDir:
+        def __init__(self, prefix):
+            self.name = str(staging_root / prefix.strip("-"))
+
+        def __enter__(self):
+            Path(self.name).mkdir(parents=True, exist_ok=True)
+            return self.name
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", _KeepDir)
+    monkeypatch.setattr(deployer_module.tempfile, "TemporaryDirectory", _KeepDir)
+
+    module_include = "/etc/nginx/modules-enabled/*.conf"
+
+    class _DynamicModuleManager(FakeNginxManager):
+        @property
+        def modules(self):
+            from pg_router.nginx.modules import NginxModules
+
+            return NginxModules(
+                binary="nginx",
+                version="1.24.0",
+                features={name: True for name in (
+                    "http", "http_ssl", "http_v2", "stream", "stream_ssl",
+                    "stream_ssl_preread",
+                )},
+                module_include=module_include,
+            )
+
+    manager = _DynamicModuleManager()
+    Deployer(parse_config_string(CONFIG), managed_dir, manager).apply(dry_run=True)
+
+    main_conf = staging_root / "pg-router-staging" / "nginx.conf"
+    text = main_conf.read_text()
+    assert f"include {module_include};" in text, (
+        "staging must load the distro's dynamic modules exactly the way the "
+        "live nginx.conf does; otherwise it tests a different module set"
+    )
+    # load_module directives belong to the main context, i.e. before the
+    # http/stream blocks that need them.
+    assert text.index(f"include {module_include};") < text.index("events {")
+
+
 # ----------------------------------------------------------------------
 # concurrent-operation protection and atomic rollback
 # ----------------------------------------------------------------------
