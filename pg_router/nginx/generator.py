@@ -213,7 +213,15 @@ class ConfigGenerator:
     # maps
     # ------------------------------------------------------------------
     def _render_maps(self, http_routes: list[ResolvedRoute], stream_routes: list[ResolvedRoute]) -> str:
-        lines = [_header("maps: shared connection-upgrade map and stream SNI/ALPN tables")]
+        """HTTP-context maps only.
+
+        Stream SNI/ALPN maps are emitted into ``stream.conf`` instead (see
+        :meth:`_render_stream_maps`): they use ``$ssl_preread_*`` variables
+        that exist *only* inside a ``stream {}`` block. Sharing one fragment
+        made the staging config reference ``$ssl_preread_server_name`` from the
+        ``http {}`` context, where nginx rejects it as an unknown variable.
+        """
+        lines = [_header("maps: shared connection-upgrade map")]
         if http_routes:
             # A SINGLE shared map: avoids the duplicate-map failure mode where
             # multiple site files each declare their own map block.
@@ -222,14 +230,30 @@ class ConfigGenerator:
             lines.append("    ''      close;")
             lines.append("}")
             lines.append("")
+        if len(lines) == 1:
+            return _header("maps: none required")
+        return "\n".join(lines) + "\n"
 
+    def _render_stream_maps(self, stream_routes: list[ResolvedRoute]) -> str:
+        """SNI/ALPN tables. These live in ``stream.conf`` because they read
+        ``$ssl_preread_server_name`` / ``$ssl_preread_alpn_protocols``, which
+        are undefined outside a ``stream {}`` context."""
+        lines: list[str] = []
         # Aggregate stream tables per listener: one map per variable, never
         # duplicated, so any number of SNI routes stay in a single block.
+        # Only listeners that actually key on SNI/ALPN get a table: emitting an
+        # empty map for a plain default route adds dead config and would route
+        # a listener's traffic through a variable nothing populates.
         sni_tables: dict[str, dict[str, str]] = {}
         alpn_tables: dict[str, dict[str, str]] = {}
         for route in stream_routes:
             selection = self._selection_of(route)
             if selection is None or selection.stream is None:
+                continue
+            # A route with no matcher resolves to an empty 'sni' selection:
+            # it is the listener's default, not an SNI route, so it must not
+            # create an (empty) SNI table.
+            if not selection.stream.values:
                 continue
             upstream = self.result.route_upstream.get(route.route.id)
             if not upstream:
@@ -259,9 +283,7 @@ class ConfigGenerator:
                 lines.append(f"    {self._alpn_map_key(protocol)} {upstream};")
             lines.append("}")
             lines.append("")
-        if len(lines) == 1:
-            return _header("maps: none required")
-        return "\n".join(lines) + "\n"
+        return "\n".join(lines)
 
     @staticmethod
     def _alpn_map_key(protocol: str) -> str:
@@ -447,6 +469,14 @@ class ConfigGenerator:
     # ------------------------------------------------------------------
     def _render_stream(self, routes: list[ResolvedRoute]) -> str:
         lines = [_header("stream routes: ssl_preread + SNI/ALPN maps")]
+
+        # The SNI/ALPN tables must be emitted *inside* the stream fragment:
+        # nginx loads stream.conf only inside a `stream {}` block, and the
+        # $ssl_preread_* variables those maps read do not exist elsewhere.
+        map_block = self._render_stream_maps(routes)
+        if map_block:
+            lines.append(map_block)
+
         by_listener: dict[str, list[ResolvedRoute]] = {}
         for route in routes:
             by_listener.setdefault(route.listener.id, []).append(route)

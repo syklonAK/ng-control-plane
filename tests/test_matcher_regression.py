@@ -47,10 +47,12 @@ routes:
 """
     result = generate(text)
     stream = result.fragments["stream.conf"]
-    maps = result.fragments["maps.conf"]
     assert "proxy_pass $pg_alpn_s;" in stream
     assert "$pg_sni_s" not in stream
-    assert "map $ssl_preread_alpn_protocols $pg_alpn_s {" in maps
+    assert "map $ssl_preread_alpn_protocols $pg_alpn_s {" in stream
+    # The ALPN map belongs in the stream fragment: $ssl_preread_* variables do
+    # not exist in the http context that loads maps.conf.
+    assert "ssl_preread_alpn_protocols" not in result.fragments["maps.conf"]
     assert result.ok, result.errors
 
 
@@ -67,6 +69,8 @@ routes:
     stream = result.fragments["stream.conf"]
     assert "proxy_pass pg_d;" in stream
     assert "pg_sni" not in stream and "pg_alpn" not in stream
+    # No stream maps at all, so the http-loaded fragment stays clean.
+    assert "ssl_preread" not in result.fragments["maps.conf"]
 
 
 def test_any_paths_reach_nginx_and_stay_simulatable():

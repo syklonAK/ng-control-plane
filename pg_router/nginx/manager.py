@@ -202,8 +202,23 @@ class NginxManager:
 
         modified = text
         changed = False
-        http_include = f"    include {managed_dir}/http.conf;"
-        stream_include = f"    include {managed_dir}/stream.conf;"
+        # Every fragment the generator can emit is loadable in its own context:
+        # - maps.conf holds only the http-upgrade map (stream SNI/ALPN tables
+        #   are emitted inside stream.conf because $ssl_preread_* variables
+        #   exist only in a stream block);
+        # - upstreams.conf is valid in both http and stream contexts;
+        # - http.conf and stream.conf carry the server blocks.
+        # Loading all four in each block keeps a stream-only host's upstreams
+        # reachable: stream.conf references upstreams that live in
+        # upstreams.conf, and nginx never loads that fragment otherwise.
+        http_include = "\n".join(
+            f"    include {managed_dir}/{name};"
+            for name in ("maps.conf", "upstreams.conf", "http.conf")
+        )
+        stream_include = "\n".join(
+            f"    include {managed_dir}/{name};"
+            for name in ("upstreams.conf", "stream.conf")
+        )
         top_load_lines = "\n".join(
             f"load_module {path};"
             for path in self.modules.load_modules

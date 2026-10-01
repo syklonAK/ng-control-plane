@@ -263,6 +263,70 @@ def test_probe_configs_contain_no_invalid_directive():
     assert "temp_path" not in main_conf
 
 
+def test_staging_config_never_puts_stream_variables_in_the_http_context(
+    managed_dir, monkeypatch, tmp_path
+):
+    """Regression: the staging main config included maps.conf in BOTH the http
+    and stream blocks, but that fragment carried the SNI/ALPN maps reading
+    $ssl_preread_server_name / $ssl_preread_alpn_protocols — variables that
+    exist only in a stream {} context. nginx -t then failed with
+    'unknown "ssl_preread_server_name" variable' for any stream config, so
+    every apply on a real host died in staging."""
+    import tempfile
+
+    import pg_router.deploy.deployer as deployer_module
+
+    staging_root = tmp_path / "captured"
+    staging_root.mkdir()
+
+    class _KeepDir:
+        def __init__(self, prefix):
+            self.name = str(staging_root / prefix.strip("-"))
+
+        def __enter__(self):
+            Path(self.name).mkdir(parents=True, exist_ok=True)
+            return self.name
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", _KeepDir)
+    monkeypatch.setattr(deployer_module.tempfile, "TemporaryDirectory", _KeepDir)
+
+    stream_config = """
+version: 1
+listeners:
+  - id: s
+    address: 0.0.0.0
+    port: 8443
+    mode: stream
+    tls: {mode: passthrough}
+backends:
+  - {id: nl, type: local, host: 10.0.0.10, port: 62050}
+routes:
+  - id: nl-tcp
+    listener: s
+    transport: {type: tcp}
+    match: {type: sni, value: nl.example.com}
+    backend: nl
+"""
+    manager = FakeNginxManager()
+    Deployer(parse_config_string(stream_config), managed_dir, manager).apply(dry_run=True)
+
+    main_conf = staging_root / "pg-router-staging" / "nginx.conf"
+    text = main_conf.read_text()
+    http_block, _ = text.split("stream {")
+    assert "ssl_preread_server_name" not in http_block, (
+        "the http context must not reference stream-only variables"
+    )
+    # The stream block includes stream.conf, which now carries the SNI map.
+    # Check the fragment itself rather than the include line.
+    stream_fragment = Path(managed_dir) / ".staging" / "stream.conf"
+    assert "ssl_preread_server_name" in stream_fragment.read_text(), (
+        "the stream fragment must carry the SNI map its server blocks use"
+    )
+
+
 # ----------------------------------------------------------------------
 # concurrent-operation protection and atomic rollback
 # ----------------------------------------------------------------------

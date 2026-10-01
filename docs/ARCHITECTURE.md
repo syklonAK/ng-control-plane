@@ -112,10 +112,10 @@ All under `/etc/nginx/pg-router/` (application-owned):
 
 | File | Contents |
 |---|---|
-| `maps.conf` | The **single** shared `$connection_upgrade` map + stream SNI/ALPN maps |
+| `maps.conf` | The **single** shared `$connection_upgrade` map (HTTP context only) |
 | `upstreams.conf` | One upstream per route; failover members as `backup` servers; a blackhole upstream for `unknown_policy: reject` |
 | `http.conf` | One `server` per host group, one `location` per route |
-| `stream.conf` | One `server` per stream listener with `ssl_preread on` and map-driven `proxy_pass` |
+| `stream.conf` | One `server` per stream listener with `ssl_preread on` and map-driven `proxy_pass`, plus the SNI/ALPN maps |
 | `state/last-deploy.json` | Deployment record (shown by `pg-router status`) |
 | `state/deploy.lock` | Advisory lock serializing `apply`/`rollback` |
 | `backups/NNNNNN-.../` | Rollback snapshots |
@@ -123,6 +123,18 @@ All under `/etc/nginx/pg-router/` (application-owned):
 The single shared map is deliberate: the original shell script wrote one map
 block per site file, so enabling a second domain produced
 `duplicate "$connection_upgrade" variable` and broke nginx entirely.
+
+The SNI/ALPN maps live *inside* `stream.conf`, not in `maps.conf`, because
+they read `$ssl_preread_server_name` / `$ssl_preread_alpn_protocols` —
+variables that exist only within a `stream {}` block. nginx loads each fragment
+in one context, so putting them in the shared file made the staging test
+reference stream-only variables from `http {}` and fail with
+`unknown "ssl_preread_server_name" variable`.
+
+Correspondingly, `ensure_managed_include` wires both `upstreams.conf` and
+`stream.conf` into the `stream {}` block of `/etc/nginx/nginx.conf`: a
+stream-only host's `stream.conf` proxies to upstreams defined in
+`upstreams.conf`, and without that include nginx resolves none of them.
 
 ## Health and failover
 

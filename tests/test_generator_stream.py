@@ -50,14 +50,18 @@ routes:
 """
     fragments = generate(text)
     stream = fragments["stream.conf"]
-    maps = fragments["maps.conf"]
     assert "ssl_preread on;" in stream
     assert "proxy_pass $pg_sni_stream;" in stream
-    assert "nl.example.com pg_nl_tcp;" in maps
-    assert "nl2.example.com pg_nl_tcp;" in maps
-    assert "fr.example.com pg_fr_tcp;" in maps
+    # SNI/ALPN maps live in stream.conf: they read $ssl_preread_* variables
+    # that exist only inside a stream {} block, so emitting them into the
+    # http-loaded maps.conf made nginx reject the whole config.
+    assert "nl.example.com pg_nl_tcp;" in stream
+    assert "nl2.example.com pg_nl_tcp;" in stream
+    assert "fr.example.com pg_fr_tcp;" in stream
     # Exactly one map per variable (never the duplicate-map failure mode).
-    assert maps.count("map $ssl_preread_server_name $pg_sni_stream {") == 1
+    assert stream.count("map $ssl_preread_server_name $pg_sni_stream {") == 1
+    # And the http-loaded maps.conf must not reference stream-only variables.
+    assert "ssl_preread" not in fragments["maps.conf"]
 
 
 def test_unknown_sni_policy_reject_uses_blackhole():
@@ -70,7 +74,7 @@ routes:
     backend: nl
 """
     fragments = generate(text)
-    assert "default pg_blackhole;" in fragments["maps.conf"]
+    assert "default pg_blackhole;" in fragments["stream.conf"]
     assert "server 127.0.0.1:9 down;" in fragments["upstreams.conf"]
 
 
@@ -91,7 +95,7 @@ routes:
     backend: fr
 """
     fragments = generate(text)
-    assert "default pg_catchall;" in fragments["maps.conf"]
+    assert "default pg_catchall;" in fragments["stream.conf"]
 
 
 def test_alpn_routing_emits_alpn_map():
@@ -104,11 +108,12 @@ routes:
     backend: nl
 """
     fragments = generate(text)
-    assert "map $ssl_preread_alpn_protocols $pg_alpn_stream {" in fragments["maps.conf"]
+    stream = fragments["stream.conf"]
+    assert "map $ssl_preread_alpn_protocols $pg_alpn_stream {" in stream
     # $ssl_preread_alpn_protocols is a comma-separated list ("h2,http/1.1"),
     # so the key must be anchored to a full element. A substring key such as
     # ~h2 would also match a protocol merely containing the text "h2".
-    assert "~^(?:[^,]+,)*h2(?:,[^,]+)*$ pg_h2_route;" in fragments["maps.conf"]
+    assert "~^(?:[^,]+,)*h2(?:,[^,]+)*$ pg_h2_route;" in stream
 
 
 def test_alpn_route_actually_selects_the_alpn_variable():
@@ -142,7 +147,8 @@ routes:
     backend: nl
 """
     fragments = generate(text)
-    assert r"~^(?:[^,]+,)*spdy/3\.1(?:,[^,]+)*$ pg_spdy_route;" in fragments["maps.conf"]
+    stream = fragments["stream.conf"]
+    assert r"~^(?:[^,]+,)*spdy/3\.1(?:,[^,]+)*$ pg_spdy_route;" in stream
 
 
 def test_stream_listener_with_only_a_default_route_proxies_directly():
@@ -243,4 +249,4 @@ routes:
     config = RouterConfig.from_dict(_load(text))
     result = ConfigGenerator(config, TopologyResolver(config)).generate()
     assert "server 127.0.0.1:41001" in result.fragments["upstreams.conf"]
-    assert "pg_sni_stream" in result.fragments["maps.conf"]
+    assert "pg_sni_stream" in result.fragments["stream.conf"]

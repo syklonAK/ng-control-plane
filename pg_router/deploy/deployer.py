@@ -321,6 +321,10 @@ class Deployer:
         for name, content in fragments.items():
             (staging / name).write_text(content, encoding="utf-8")
 
+        # Each context includes only the fragments it can actually parse:
+        # the SNI/ALPN maps live inside stream.conf (they read
+        # $ssl_preread_* variables that exist only in a stream block), so the
+        # stream context needs the upstreams but not the http-only maps.
         http_includes = "\n".join(
             f"    include {staging / name};"
             for name in ("maps.conf", "upstreams.conf", "http.conf")
@@ -328,7 +332,7 @@ class Deployer:
         )
         stream_includes = "\n".join(
             f"    include {staging / name};"
-            for name in ("maps.conf", "stream.conf")
+            for name in ("upstreams.conf", "stream.conf")
             if name in fragments
         )
 
