@@ -342,18 +342,19 @@ class Deployer:
         # that the live config pulls in via its modules-enabled include, and
         # without them nginx fails with "unknown ssl_preread_server_name
         # variable" before the fragments are ever swapped in.
-        module_lines = self.manager.modules.load_lines()
+        modules = self.manager.modules
+        module_lines = modules.load_lines()
 
         with tempfile.TemporaryDirectory(prefix="pg-router-staging-") as tempdir:
-            prefix = Path(tempdir)
-            (prefix / "logs").mkdir()
-            main_conf = prefix / "nginx.conf"
+            scratch = Path(tempdir)
+            (scratch / "logs").mkdir()
+            main_conf = scratch / "nginx.conf"
             # Only main-context directives nginx actually supports: there is no
             # bare "temp_path" (nginx uses client_body_temp_path / proxy_temp_path
             # / ...). "nginx -t" parses only, so no temp paths are needed.
             main_conf.write_text(
-                f"error_log {prefix / 'logs' / 'error.log'} warn;\n"
-                f"pid {prefix / 'nginx.pid'};\n"
+                f"error_log {scratch / 'logs' / 'error.log'} warn;\n"
+                f"pid {scratch / 'nginx.pid'};\n"
                 f"{module_lines}\n"
                 "worker_processes auto;\n"
                 "events { worker_connections 128; }\n"
@@ -365,7 +366,14 @@ class Deployer:
                 "}\n",
                 encoding="utf-8",
             )
-            ok, output = self.manager.test(main_conf=str(main_conf), prefix=str(prefix))
+            # nginx resolves the relative load_module paths in Debian's
+            # modules-enabled include against its build prefix, so the staging
+            # test must run with that prefix rather than the scratch directory
+            # — otherwise nginx looks for "<scratch>/modules/ngx_stream_module.so",
+            # fails the dlopen, and rolls back a config that would have worked
+            # live.
+            prefix = modules.prefix or str(scratch)
+            ok, output = self.manager.test(main_conf=str(main_conf), prefix=prefix)
         if not ok:
             output = self._filter_staging_output(output, str(staging))
         return ok, output

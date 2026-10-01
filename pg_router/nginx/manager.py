@@ -229,8 +229,17 @@ class NginxManager:
         modules = self.modules
         covered = self._load_module_paths_in_text(text)
         if modules.module_include:
-            covered |= module_detector._include_loads(modules.module_include)
-        extra = [path for path in modules.load_modules if path not in covered]
+            covered |= module_detector._include_loads(modules.module_include, modules.prefix)
+        # nginx identifies a loaded module by its .so filename, not the path
+        # it was loaded from: the distro include may spell the path relatively
+        # while detection records an absolute one, and the same module can sit
+        # in more than one directory. Comparing filenames keeps nginx from
+        # being handed the same module twice ("module ... is already loaded").
+        covered_names = module_detector._module_names(covered)
+        extra = [
+            path for path in modules.load_modules
+            if module_detector._module_name_of(path) not in covered_names
+        ]
         if modules.module_include and modules.module_include not in text:
             top_load_lines = "\n".join(
                 [f"include {modules.module_include};"]
@@ -277,8 +286,7 @@ class NginxManager:
         _log.info("Wired managed includes into %s (backup at %s)", DEFAULT_MAIN_CONF, backup)
         return True
 
-    @staticmethod
-    def _load_module_paths_in_text(text: str) -> set[str]:
+    def _load_module_paths_in_text(self, text: str) -> set[str]:
         """Every .so an existing ``load_module`` line in this file loads."""
         loaded: set[str] = set()
         for line in text.splitlines():

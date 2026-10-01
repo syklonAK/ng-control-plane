@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import glob
 import os
+import posixpath
 import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from ..utils.logging import get_logger
 from ..utils.system import CommandError, run, which
@@ -135,6 +136,13 @@ class NginxModules:
     # Glob of distro .conf files that load the dynamic modules (see
     # DYNAMIC_MODULE_INCLUDES). Preferred over ``load_modules`` when present.
     module_include: Optional[str] = None
+    # The ``--prefix`` nginx was configured with. Debian/Ubuntu ship module
+    # .conf files whose ``load_module`` paths are *relative* ("modules/
+    # ngx_stream_module.so"), and nginx resolves them against this prefix —
+    # never against the config file's directory. A staging/probe config must
+    # therefore be tested with the real prefix, or nginx goes looking for the
+    # .so inside the throwaway temp dir and every dlopen fails.
+    prefix: str = ""
 
     def supports(self, feature: str) -> bool:
         return bool(self.features.get(feature))
@@ -156,6 +164,7 @@ class NginxModules:
             "features": dict(self.features),
             "load_modules": list(self.load_modules),
             "module_include": self.module_include,
+            "prefix": self.prefix,
         }
 
     def load_lines(self) -> str:
@@ -178,9 +187,9 @@ class NginxModules:
         covered: set[str] = set()
         if self.module_include:
             lines.append(f"include {self.module_include};")
-            covered = _include_loads(self.module_include)
+            covered = _module_names(_include_loads(self.module_include, self.prefix))
         for path in self.load_modules:
-            if path not in covered:
+            if _module_name_of(path) not in covered:
                 lines.append(f"load_module {path};")
         return "\n".join(lines)
 
@@ -209,6 +218,22 @@ def _parse_version_output(stderr: str) -> tuple[str, list[str]]:
     return version, args
 
 
+def _configure_prefix(configure_args: list[str]) -> str:
+    """The ``--prefix`` nginx was built with.
+
+    Debian/Ubuntu's ``modules-enabled/*.conf`` hold *relative* load_module
+    paths ("modules/ngx_stream_module.so"), and nginx resolves them against
+    this prefix — not against the config file's own directory. A standalone
+    config that includes them must therefore be tested with ``-p <prefix>``,
+    or nginx hunts for the .so files in whatever scratch directory the config
+    happens to live in.
+    """
+    for arg in configure_args:
+        if arg.startswith("--prefix="):
+            return arg.split("=", 1)[1]
+    return ""
+
+
 def _find_dynamic_module(feature: str) -> Optional[str]:
     for filename in DYNAMIC_MODULE_FILES.get(feature, ()):
         for directory in DYNAMIC_MODULE_DIRS:
@@ -226,12 +251,18 @@ def _find_module_include() -> Optional[str]:
     return None
 
 
-def _include_loads(module_include: Optional[str]) -> set[str]:
+def _include_loads(module_include: Optional[str], prefix: str = "") -> set[str]:
     """Module .so paths a distro include glob loads.
 
     Needed so an explicit ``load_module`` is only added for modules the
     curated list does not already cover: nginx refuses to load a module
     twice and fails the whole config.
+
+    Debian/Ubuntu spells the paths *relatively* ("modules/ngx_stream_module.so"),
+    resolved by nginx against its build prefix, while our own
+    ``load_modules`` are absolute. Both sides are therefore resolved against
+    ``prefix`` and normalized before comparing, or the same file would be
+    loaded twice and nginx would abort with ``module "..." is already loaded``.
     """
     if not module_include:
         return set()
@@ -244,8 +275,35 @@ def _include_loads(module_include: Optional[str]) -> set[str]:
         for line in content.splitlines():
             parts = line.split()
             if len(parts) == 2 and parts[0] == "load_module":
-                loaded.add(parts[1].rstrip(";"))
+                loaded.add(_normalize_module_path(parts[1].rstrip(";"), prefix))
     return loaded
+
+
+def _normalize_module_path(path: str, prefix: str = "") -> str:
+    """Resolve a load_module path the way nginx does and canonicalize it.
+
+    nginx resolves relative module paths against the ``-p`` prefix (Debian's
+    modules-enabled uses "modules/ngx_stream_module.so"). Canonicalizing lets
+    a relative include entry and an absolute detection result be recognized
+    as the same file.
+
+    Module paths are always POSIX ones, so separators are canonicalized to
+    "/" before normalizing — otherwise the Windows test runner turns
+    "/usr/lib/nginx/modules/x.so" into a completely different path and the
+    deduplication this exists for silently stops working off-Linux.
+    """
+    if prefix and not os.path.isabs(path):
+        path = os.path.join(prefix, path)
+    return posixpath.normpath(path.replace("\\", "/"))
+
+
+def _module_name_of(path: str) -> str:
+    """The .so filename nginx identifies a loaded module by."""
+    return posixpath.basename(path.replace("\\", "/"))
+
+
+def _module_names(paths: Iterable[str]) -> set[str]:
+    return {_module_name_of(path) for path in paths}
 
 
 # Core modules other dynamic modules link against; loaded first so dlopen can
@@ -290,6 +348,7 @@ def detect(binary: Optional[str] = None) -> NginxModules:
     except CommandError:
         return modules
     modules.version, modules.configure_args = _parse_version_output(result.stderr)
+    modules.prefix = _configure_prefix(modules.configure_args)
 
     args_text = " ".join(modules.configure_args)
     for feature in FEATURE_PROBES:
@@ -340,37 +399,51 @@ def detect(binary: Optional[str] = None) -> NginxModules:
 def probe_features(binary: str, modules: Optional[NginxModules] = None) -> dict[str, bool]:
     """Functional probe: can this nginx actually parse each directive?
 
-    Each probe config is written to a temporary prefix and tested with
+    Each probe config is written to a temporary directory and tested with
     ``nginx -t``. Nothing is bound permanently and no live config is touched.
     """
     results: dict[str, bool] = {}
     load_lines = modules.load_lines() if modules else ""
+    prefix = modules.prefix if modules else ""
     for feature, template in FEATURE_PROBES.items():
         config = template.replace("PROBEPORT", str(PROBE_PORT)).replace(
             "PROBEPORT2", str(PROBE_PORT_2)
         )
-        results[feature] = _run_probe(binary, feature, config, load_lines)
+        results[feature] = _run_probe(binary, feature, config, load_lines, prefix)
     return results
 
 
-def _run_probe(binary: str, feature: str, config: str, load_lines: str) -> bool:
+def _run_probe(
+    binary: str,
+    feature: str,
+    config: str,
+    load_lines: str,
+    nginx_prefix: str = "",
+) -> bool:
     with tempfile.TemporaryDirectory(prefix="pg-router-probe-") as tempdir:
-        prefix = Path(tempdir)
-        (prefix / "logs").mkdir()
-        main_conf = prefix / "nginx.conf"
+        scratch = Path(tempdir)
+        (scratch / "logs").mkdir()
+        main_conf = scratch / "nginx.conf"
         # Only directives nginx actually has in the main context. There is no
         # bare "temp_path" directive (nginx uses client_body_temp_path,
         # proxy_temp_path, ...); "nginx -t" never writes temp files anyway, so
         # none of them belong here.
         main_conf.write_text(
-            f"error_log {prefix / 'logs' / 'error.log'} warn;\n"
-            f"pid {prefix / 'nginx.pid'};\n"
+            f"error_log {scratch / 'logs' / 'error.log'} warn;\n"
+            f"pid {scratch / 'nginx.pid'};\n"
             f"{load_lines}\n"
             f"{config}\n",
             encoding="utf-8",
         )
+        # ``-p`` must be nginx's real prefix, not the scratch directory: the
+        # distro's module .conf files use relative load_module paths, which
+        # nginx resolves against the prefix. With the scratch dir as prefix,
+        # nginx looked for "<scratch>/modules/ngx_stream_module.so", found
+        # nothing, and reported every dynamic module as missing — which then
+        # made detection claim the host lacks stream entirely.
+        prefix = nginx_prefix or str(scratch)
         try:
-            run([binary, "-t", "-p", str(prefix), "-c", str(main_conf)], check=True, timeout=30)
+            run([binary, "-t", "-p", prefix, "-c", str(main_conf)], check=True, timeout=30)
         except CommandError as exc:
             _log.debug("probe %s failed: %s", feature, exc)
             return False
@@ -389,4 +462,5 @@ def probe_single(
         "PROBEPORT2", str(PROBE_PORT_2)
     )
     load_lines = modules.load_lines() if modules else ""
-    return _run_probe(binary, feature, config, load_lines)
+    prefix = modules.prefix if modules else ""
+    return _run_probe(binary, feature, config, load_lines, prefix)

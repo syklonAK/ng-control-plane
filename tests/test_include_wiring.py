@@ -233,7 +233,7 @@ def test_modules_the_include_does_not_cover_are_added(dynamic_module_manager, mo
     monkeypatch.setattr(
         module_detector,
         "_include_loads",
-        lambda include: {"/usr/lib/nginx/modules/ngx_stream_module.so"},
+        lambda include, prefix="": {"/usr/lib/nginx/modules/ngx_stream_module.so"},
     )
     dynamic_module_manager.ensure_managed_include(
         dynamic_module_manager._managed_dir, ()

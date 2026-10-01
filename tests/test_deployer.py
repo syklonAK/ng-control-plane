@@ -387,6 +387,79 @@ def test_staging_config_loads_the_same_dynamic_modules_as_live(
     assert text.index(f"include {module_include};") < text.index("events {")
 
 
+def test_staging_is_tested_with_the_real_nginx_prefix(
+    managed_dir, monkeypatch, tmp_path
+):
+    """Regression: the staging test ran ``nginx -t -p <tempdir>``, but the
+    Debian/Ubuntu module include uses *relative* load_module paths
+    ("modules/ngx_stream_module.so"). nginx resolves those against the prefix,
+    so it looked for the .so inside the throwaway staging dir, failed the
+    dlopen, and rolled back a configuration the live tree would have accepted.
+
+    The symptom on the server was::
+
+        dlopen() "/tmp/pg-router-staging-.../modules/ngx_stream_module.so" failed
+        ... in /etc/nginx/modules-enabled/50-mod-stream.conf:1
+    """
+    import tempfile
+
+    import pg_router.deploy.deployer as deployer_module
+
+    staging_root = tmp_path / "captured"
+    staging_root.mkdir()
+
+    class _KeepDir:
+        def __init__(self, prefix):
+            self.name = str(staging_root / prefix.strip("-"))
+
+        def __enter__(self):
+            Path(self.name).mkdir(parents=True, exist_ok=True)
+            return self.name
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", _KeepDir)
+    monkeypatch.setattr(deployer_module.tempfile, "TemporaryDirectory", _KeepDir)
+
+    module_include = "/etc/nginx/modules-enabled/*.conf"
+
+    class _PrefixManager(FakeNginxManager):
+        def __init__(self):
+            super().__init__()
+            self.test_calls = []
+
+        def test(self, main_conf=None, prefix=None):
+            self.test_calls.append((main_conf, prefix))
+            return True, "nginx: configuration file test is successful"
+
+        @property
+        def modules(self):
+            from pg_router.nginx.modules import NginxModules
+
+            return NginxModules(
+                binary="nginx",
+                version="1.24.0",
+                features={name: True for name in (
+                    "http", "http_ssl", "http_v2", "stream", "stream_ssl",
+                    "stream_ssl_preread",
+                )},
+                module_include=module_include,
+                prefix="/usr/share/nginx",
+            )
+
+    manager = _PrefixManager()
+    Deployer(parse_config_string(CONFIG), managed_dir, manager).apply(dry_run=True)
+
+    assert manager.test_calls, "staging must run nginx -t"
+    _, staging_prefix = manager.test_calls[0]
+    assert staging_prefix == "/usr/share/nginx", (
+        "relative load_module paths in the distro include resolve against the "
+        "nginx prefix; testing against the scratch dir makes nginx search for "
+        "the .so where it does not exist"
+    )
+
+
 # ----------------------------------------------------------------------
 # concurrent-operation protection and atomic rollback
 # ----------------------------------------------------------------------
