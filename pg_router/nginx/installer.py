@@ -158,6 +158,10 @@ class NginxInstaller:
         if not names:
             return
         update_cmd, install_prefix = package_commands(self.family)
+        # Say this explicitly: apt prints nothing while it works, and a silent
+        # multi-minute pause after this point looks exactly like a hung install
+        # (it is most often an unattended-upgrades job holding the dpkg lock).
+        _log.info("Updating package lists (this can take a few minutes)...")
         if which("apt-get") and self.family == "debian":
             run(["apt-get", "update", "-qq"], check=False, timeout=300)
         else:
